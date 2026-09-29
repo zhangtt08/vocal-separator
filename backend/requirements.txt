@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchaudio==2.5.1+cu124
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.19
+demucs==4.0.1
+imageio-ffmpeg==0.5.1
