@@ -206,7 +206,10 @@ def _job_cancel(input: dict[str, Any], _ctx: dict[str, Any]) -> dict[str, Any]:
         raise AgentError("conflict", f"任务已经结束了，无法取消（当前状态：{snapshot.get('status')}）")
     result = main.cancel_job(job_id)
     result["source_name"] = snapshot.get("source_name")
-    result["note"] = "已请求取消：Demucs 子进程被终止，任务目录已清理，源文件不会被保留。"
+    result["note"] = (
+        "已请求取消：Demucs 子进程会被终止、该任务的输出目录会被清理；"
+        "提交时复制进 uploads 的那份副本会被删除，你本机选中的原文件不受影响。"
+    )
     return result
 
 
