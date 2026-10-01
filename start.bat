@@ -5,6 +5,7 @@ title Vocal Separator Launcher
 set "APP_DIR=%~dp0"
 set "BACKEND_DIR=%APP_DIR%backend"
 set "APP_URL=http://127.0.0.1:3000"
+set "BACKEND_URL=http://127.0.0.1:8000/api/health"
 
 echo ========================================
 echo   Vocal Separator - Local AI Service
@@ -41,15 +42,13 @@ echo       Frontend is already running.
 
 :wait_services
 echo [3/4] Waiting for services. First launch may be slower...
-set /a WAIT_COUNT=0
-
-:wait_loop
-powershell -NoProfile -Command "try { $front=Invoke-WebRequest -UseBasicParsing -Uri '%APP_URL%' -TimeoutSec 2; $back=Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health' -TimeoutSec 2; if ($front.StatusCode -eq 200 -and $back.status -eq 'ok') { exit 0 } } catch {}; exit 1" >nul 2>&1
+rem Polling happens inside one PowerShell process (scripts\wait-for-services.ps1)
+rem instead of one process per second from batch.
+set "PS=%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PS%" set "PS=powershell"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\wait-for-services.ps1" -FrontendUrl "%APP_URL%" -BackendUrl "%BACKEND_URL%" -TimeoutSec 45
 if not errorlevel 1 goto ready
-set /a WAIT_COUNT+=1
-if %WAIT_COUNT% GEQ 45 goto startup_failed
-timeout /t 1 /nobreak >nul
-goto wait_loop
+goto startup_failed
 
 :ready
 echo [4/4] Ready. Opening the Chinese interface...

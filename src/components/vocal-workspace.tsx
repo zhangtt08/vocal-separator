@@ -4,12 +4,15 @@ import {
   AudioLines,
   Check,
   CircleCheck,
+  Clock3,
   Cpu,
   Download,
   Drum,
   FileAudio,
+  FolderOpen,
   Guitar,
   Headphones,
+  History,
   LoaderCircle,
   Mic2,
   Music2,
@@ -60,53 +63,137 @@ const ALLOWED_EXTENSIONS = new Set([
   "webm",
   "avi",
 ]);
-const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "webm", "avi"]);
 const POLL_INTERVAL = 1000;
 
-type WorkspaceStatus =
-  | "idle"
+type ServiceState = "checking" | "online" | "offline" | "missing";
+type ItemState =
+  | "confirm"
+  | "waiting"
   | "uploading"
   | "processing"
   | "done"
-  | "error";
-type ServiceState = "checking" | "online" | "offline" | "missing";
+  | "error"
+  | "cancelled";
 
-interface Stem {
-  size_mb: number;
+interface StemInfo {
+  label?: string;
+  size_mb?: number;
+  bytes?: number;
+  path?: string;
+  exists?: boolean;
 }
 
-interface JobResponse {
+interface JobSnapshot {
   job_id: string;
-  status:
-    | "queued"
-    | "processing"
-    | "cancelling"
-    | "cancelled"
-    | "done"
-    | "error";
+  status: "queued" | "processing" | "cancelling" | "cancelled" | "done" | "error";
   progress: number;
+  phase?: string;
+  phase_label?: string;
   error?: string | null;
-  stems?: Record<string, Stem>;
+  stems?: Record<string, StemInfo>;
+  preset?: string;
+  source_name?: string | null;
+  elapsed_seconds?: number | null;
+  eta_seconds?: number | null;
+  queue_position?: number;
+  output_dir?: string | null;
 }
 
-interface CompletedJob extends JobResponse {
-  status: "done";
-  stems: Record<string, Stem>;
+interface PresetStem {
+  name: string;
+  label_zh: string;
+  label_en: string;
+}
+
+interface PresetInfo {
+  preset: string;
+  label: string;
+  description: string;
+  is_default?: boolean;
+  stems: PresetStem[];
+}
+
+interface HealthInfo {
+  status?: string;
+  demucs_available?: boolean;
+  ffmpeg_available?: boolean;
+  gpu_available?: boolean;
+  cuda_available?: boolean;
+  cuda_device_name?: string | null;
+  cuda_note?: string;
+  torch_version?: string | null;
+  demucs_version?: string | null;
+  ffmpeg_path?: string | null;
+  python_version?: string | null;
+  active_jobs?: number;
+  version?: string;
+  model?: string;
+  presets?: PresetInfo[];
+  model_cache?: {
+    cached?: boolean;
+    size_mb?: number;
+    note?: string | null;
+  };
+}
+
+interface HistoryStem {
+  name: string;
+  label?: string;
+  path?: string;
+  bytes?: number;
+  exists?: boolean;
+}
+
+interface HistoryEntry {
+  job_id: string;
+  preset?: string;
+  source_name?: string;
+  source_bytes?: number;
+  created_at?: number;
+  finished_at?: number;
+  output_dir?: string;
+  stems: HistoryStem[];
+  available_stems?: number;
+  total_bytes?: number;
+  expired?: boolean;
+}
+
+interface QueueItem {
+  key: string;
+  file: File | null;
+  name: string;
+  size: number;
+  state: ItemState;
+  uploadPct: number;
+  job?: JobSnapshot;
+  error?: string | null;
+  duplicateOf?: string;
 }
 
 interface StemMeta {
   label: string;
-  fileLabel: string;
   icon: LucideIcon;
 }
 
-const STEM_ORDER = ["vocals", "drums", "bass", "other"] as const;
 const STEM_META: Record<string, StemMeta> = {
-  vocals: { label: "人声", fileLabel: "人声", icon: Mic2 },
-  drums: { label: "鼓组", fileLabel: "鼓组", icon: Drum },
-  bass: { label: "贝斯", fileLabel: "贝斯", icon: Guitar },
-  other: { label: "其他乐器", fileLabel: "其他乐器", icon: Music2 },
+  vocals: { label: "人声", icon: Mic2 },
+  drums: { label: "鼓组", icon: Drum },
+  bass: { label: "贝斯", icon: Guitar },
+  other: { label: "其他乐器", icon: Music2 },
+  no_vocals: { label: "伴奏", icon: Headphones },
 };
+const STEM_ORDER = ["vocals", "no_vocals", "drums", "bass", "other"];
+
+/** 桌面壳（electron/preload.cjs）才有；浏览器模式返回 null，导出退回默认下载目录。 */
+interface DesktopShell {
+  saveStem?: (payload: { jobId: string; stem: string; suggestedName: string }) => Promise<{
+    saved: boolean;
+    path?: string;
+    bytes?: number;
+    reason?: string;
+  }>;
+  revealPath?: (targetPath: string) => Promise<boolean>;
+}
 
 function getExtension(fileName: string) {
   return fileName.split(".").pop()?.toLowerCase() || "";
@@ -125,12 +212,52 @@ function validateFile(file: File) {
   return null;
 }
 
-function formatSize(sizeMb: number) {
-  return `${sizeMb.toFixed(1)} MB`;
+function formatSize(bytes?: number) {
+  if (!bytes && bytes !== 0) return "大小未知";
+  const megabytes = bytes / (1024 * 1024);
+  return `${megabytes.toFixed(1)} MB`;
+}
+
+function formatDuration(seconds?: number | null) {
+  if (seconds === null || seconds === undefined) return "--";
+  const total = Math.max(0, Math.round(seconds));
+  if (total < 60) return `${total} 秒`;
+  return `${Math.floor(total / 60)} 分 ${String(total % 60).padStart(2, "0")} 秒`;
+}
+
+function formatClock(unixSeconds?: number | null) {
+  if (!unixSeconds) return "";
+  return new Date(unixSeconds * 1000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function delay(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+/** 把后端的真实报错翻译成"下一步该做什么"，找不到对应原因就原样给出后端信息。 */
+function remedyFor(message?: string | null): string | null {
+  if (!message) return null;
+  if (message.includes("No module named") && message.includes("demucs")) {
+    return "后端用的那个 Python 里没装 Demucs：在本机执行 python -m pip install -r backend/requirements.txt";
+  }
+  if (message.includes("未找到 ffmpeg")) {
+    return "装 ffmpeg（或把 ffmpeg.exe 放进 backend 目录），也可以直接上传音频格式避开转码。";
+  }
+  if (message.toLowerCase().includes("cuda out of memory")) {
+    return "显卡显存不够：先关掉其它占用显卡的程序，或改用 CPU（慢很多）后重试。";
+  }
+  if (message.includes("torch") || message.toLowerCase().includes("cuda")) {
+    return "PyTorch/CUDA 没就绪：python -m pip install -r backend/requirements.txt 里锁了 CUDA 12.4 版轮子。";
+  }
+  if (message.includes("任务不存在或已过期")) {
+    return "结果只保留 1 小时，超时后会自动清理，需要重新分离。";
+  }
+  return null;
 }
 
 function friendlyError(error: unknown, fallback: string) {
@@ -155,21 +282,118 @@ async function getErrorMessage(response: Response) {
   return `服务请求失败（${response.status}）`;
 }
 
+function makeKey() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** fetch 拿不到上传进度（大文件要等几十秒没有反馈），所以上传用 XHR。 */
+function uploadForSeparation(
+  file: File,
+  preset: string,
+  onProgress: (percent: number) => void,
+): Promise<{ job: JobSnapshot; controller: AbortController }> {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    formData.append("preset", preset);
+
+    const request = new XMLHttpRequest();
+    request.open("POST", `${API_BASE}/api/separate`);
+    request.responseType = "text";
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
+      }
+    };
+    request.onabort = () => reject(new DOMException("已取消", "AbortError"));
+    request.onerror = () => reject(new Error("无法连接本地 AI 服务"));
+    request.onload = () => {
+      if (controller.signal.aborted) {
+        reject(new DOMException("已取消", "AbortError"));
+        return;
+      }
+      let parsed: JobSnapshot | { detail?: string } = {};
+      try {
+        parsed = JSON.parse(request.responseText || "{}") as JobSnapshot;
+      } catch {
+        reject(new Error(`服务返回了无法解析的内容（${request.status}）`));
+        return;
+      }
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error((parsed as { detail?: string }).detail || `服务请求失败（${request.status}）`));
+        return;
+      }
+      const job = parsed as JobSnapshot;
+      if (!job.job_id) {
+        reject(new Error("服务未返回有效任务编号。"));
+        return;
+      }
+      onProgress(100);
+      resolve({ job, controller });
+    };
+    controller.signal.addEventListener("abort", () => request.abort());
+    request.send(formData);
+  });
+}
+
 export function VocalWorkspace() {
-  const [status, setStatus] = useState<WorkspaceStatus>("idle");
+  const [items, setItems] = useState<QueueItem[]>([]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [presetChoice, setPresetChoice] = useState<string | null>(null);
+  const [health, setHealth] = useState<HealthInfo | null>(null);
   const [serviceState, setServiceState] = useState<ServiceState>("checking");
-  const [progress, setProgress] = useState(0);
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<CompletedJob | null>(null);
-  const [downloading, setDownloading] = useState<string | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const uploadControllerRef = useRef<AbortController | null>(null);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const itemsRef = useRef<QueueItem[]>([]);
+  const runningRef = useRef(false);
+  const activeJobRef = useRef<string | null>(null);
+  const abandonRef = useRef<Set<string>>(new Set());
   const serviceControllerRef = useRef<AbortController | null>(null);
-  const currentJobIdRef = useRef<string | null>(null);
-  const requestSequenceRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const mountedRef = useRef(true);
+
+  // 预设标签与轨名全部来自后端 /api/health 的 data.presets（backend.preset_descriptors()）；
+  // 这里只做"没选过就用后端默认"的推导，不在 effect 里回写 state。
+  const presets: PresetInfo[] = health?.presets || [];
+  const preset =
+    presetChoice && presets.some((entry) => entry.preset === presetChoice)
+      ? presetChoice
+      : presets[0]?.preset || "four_stems";
+
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      serviceControllerRef.current?.abort();
+    };
+  }, []);
+
+  const patch = useCallback((key: string, changes: Partial<QueueItem>) => {
+    setItems((current) =>
+      current.map((item) => (item.key === key ? { ...item, ...changes } : item)),
+    );
+  }, []);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/history?limit=60`, { cache: "no-store" });
+      if (!response.ok) return;
+      const body = (await response.json()) as { items?: HistoryEntry[] };
+      if (mountedRef.current) setHistory(body.items || []);
+    } catch {
+      // 服务没起来时历史列表留空即可，不额外打扰用户。
+    }
+  }, []);
 
   const checkService = useCallback(async () => {
     serviceControllerRef.current?.abort();
@@ -186,144 +410,186 @@ export function VocalWorkspace() {
         setServiceState("offline");
         return;
       }
-      const health = (await response.json()) as { demucs_available?: boolean };
-      setServiceState(health.demucs_available ? "online" : "missing");
+      const payload = (await response.json()) as HealthInfo & { data?: HealthInfo };
+      // /api/health 同时带旧键（Electron 探针读的那几个）与标准信封 data。
+      const merged: HealthInfo = { ...(payload.data || {}), ...payload };
+      setHealth(merged);
+      setServiceState(merged.demucs_available ? "online" : "missing");
+      if (merged.demucs_available) void loadHistory();
     } catch {
       if (!controller.signal.aborted) setServiceState("offline");
     }
-  }, []);
+  }, [loadHistory]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void checkService(), 0);
-    return () => {
-      window.clearTimeout(timer);
-      serviceControllerRef.current?.abort();
-    };
+    return () => window.clearTimeout(timer);
   }, [checkService]);
 
-  useEffect(() => {
-    return () => {
-      requestSequenceRef.current += 1;
-      uploadControllerRef.current?.abort();
-      serviceControllerRef.current?.abort();
-    };
-  }, []);
-
-  const pollJob = useCallback(async (jobId: string, sequence: number) => {
-    let consecutiveFailures = 0;
-
-    while (requestSequenceRef.current === sequence) {
-      await delay(POLL_INTERVAL);
-
-      try {
-        const response = await fetch(`${API_BASE}/api/jobs/${jobId}`, {
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error(await getErrorMessage(response));
-
-        const job = (await response.json()) as JobResponse;
-        consecutiveFailures = 0;
-        setProgress(Math.max(1, Math.min(job.progress ?? 0, 100)));
-
-        if (job.status === "done" && job.stems) {
-          setResult({ ...job, status: "done", stems: job.stems });
-          setStatus("done");
-          return;
+  const pollJob = useCallback(
+    async (key: string, jobId: string) => {
+      let failures = 0;
+      for (;;) {
+        if (!mountedRef.current) return null;
+        if (abandonRef.current.has(key)) {
+          activeJobRef.current = null;
+          return null;
         }
+        await delay(POLL_INTERVAL);
+        try {
+          const response = await fetch(`${API_BASE}/api/jobs/${jobId}`, { cache: "no-store" });
+          if (!response.ok) throw new Error(await getErrorMessage(response));
+          const job = (await response.json()) as JobSnapshot;
+          failures = 0;
+          patch(key, { job });
 
-        if (job.status === "cancelled") {
-          setStatus("idle");
-          setProgress(0);
-          setFileName(null);
-          currentJobIdRef.current = null;
-          return;
-        }
-
-        if (job.status === "error") {
-          throw new Error(job.error || "音轨分离失败，请重试。");
-        }
-      } catch (pollError) {
-        consecutiveFailures += 1;
-        if (consecutiveFailures < 3) continue;
-        throw pollError;
-      }
-    }
-  }, []);
-
-  const handleFile = useCallback(
-    async (file: File) => {
-      if (serviceState !== "online") {
-        setError("本地 AI 服务尚未就绪，请先重新检测。");
-        setStatus("error");
-        return;
-      }
-
-      const validationError = validateFile(file);
-      if (validationError) {
-        setFileName(file.name);
-        setError(validationError);
-        setStatus("error");
-        return;
-      }
-
-      const sequence = requestSequenceRef.current + 1;
-      requestSequenceRef.current = sequence;
-      uploadControllerRef.current?.abort();
-      const controller = new AbortController();
-      uploadControllerRef.current = controller;
-
-      setFileName(file.name);
-      setError(null);
-      setResult(null);
-      currentJobIdRef.current = null;
-      setProgress(1);
-      setStatus("uploading");
-
-      const formData = new FormData();
-      formData.append("file", file);
-
-      try {
-        const response = await fetch(`${API_BASE}/api/separate`, {
-          method: "POST",
-          body: formData,
-          signal: controller.signal,
-        });
-
-        if (!response.ok) throw new Error(await getErrorMessage(response));
-        const job = (await response.json()) as JobResponse;
-        if (!job.job_id) throw new Error("服务未返回有效任务编号。");
-        if (requestSequenceRef.current !== sequence) return;
-
-        currentJobIdRef.current = job.job_id;
-        setServiceState("online");
-        setStatus("processing");
-        setProgress(Math.max(job.progress || 1, 2));
-        await pollJob(job.job_id, sequence);
-      } catch (submitError) {
-        if (controller.signal.aborted || requestSequenceRef.current !== sequence) {
-          return;
-        }
-        const message = friendlyError(
-          submitError,
-          "无法连接本地 AI 服务，请重新检测后再试。",
-        );
-        setError(message);
-        setStatus("error");
-        if (message.includes("fetch") || message.includes("连接")) {
-          setServiceState("offline");
+          if (job.status === "done") {
+            activeJobRef.current = null;
+            void loadHistory();
+            return job;
+          }
+          if (job.status === "error") {
+            activeJobRef.current = null;
+            patch(key, {
+              state: "error",
+              error: job.error || "音轨分离失败，请重试。",
+            });
+            return null;
+          }
+          if (job.status === "cancelled") {
+            activeJobRef.current = null;
+            patch(key, { state: "cancelled", job });
+            return null;
+          }
+        } catch (pollError) {
+          failures += 1;
+          if (failures < 3) continue;
+          activeJobRef.current = null;
+          patch(key, {
+            state: "error",
+            error: friendlyError(pollError, "读取任务进度失败，请稍后重试。"),
+          });
+          return null;
         }
       }
     },
-    [pollJob, serviceState],
+    [loadHistory, patch],
+  );
+
+  const runItem = useCallback(
+    async (key: string) => {
+      const item = itemsRef.current.find((entry) => entry.key === key);
+      const file = item?.file;
+      if (!file) return;
+
+      setSelectedKey(key);
+      patch(key, { state: "uploading", uploadPct: 0, error: null });
+      try {
+        const { job } = await uploadForSeparation(file, preset, (percent) =>
+          patch(key, { uploadPct: percent }),
+        );
+        if (abandonRef.current.has(key)) {
+          abandonRef.current.delete(key);
+          activeJobRef.current = job.job_id;
+          await fetch(`${API_BASE}/api/jobs/${job.job_id}/cancel`, { method: "POST" }).catch(() => null);
+          patch(key, { state: "cancelled" });
+          return;
+        }
+        activeJobRef.current = job.job_id;
+        patch(key, { state: "processing", job });
+        await pollJob(key, job.job_id);
+      } catch (submitError) {
+        activeJobRef.current = null;
+        if (submitError instanceof DOMException && submitError.name === "AbortError") {
+          patch(key, { state: "cancelled" });
+          return;
+        }
+        const message = friendlyError(submitError, "无法连接本地 AI 服务，请重新检测后再试。");
+        patch(key, { state: "error", error: message });
+        if (message.includes("连接") || message.includes("fetch")) setServiceState("offline");
+      }
+    },
+    [patch, pollJob, preset],
+  );
+
+  const pump = useCallback(async () => {
+    if (runningRef.current || !mountedRef.current) return;
+    const next = itemsRef.current.find((entry) => entry.state === "waiting");
+    if (!next) return;
+    runningRef.current = true;
+    setItems((current) =>
+      current.map((entry) =>
+        entry.key === next.key ? { ...entry, state: "uploading" as ItemState } : entry,
+      ),
+    );
+    try {
+      await runItem(next.key);
+    } finally {
+      runningRef.current = false;
+    }
+    if (mountedRef.current) void pump();
+  }, [runItem]);
+
+  // items 变化后驱动队列：任何一行变成 waiting 就顺着往下跑。
+  useEffect(() => {
+    if (items.some((entry) => entry.state === "waiting")) void pump();
+  }, [items, pump]);
+
+  const enqueue = useCallback(
+    (files: File[]) => {
+      const accepted: QueueItem[] = [];
+      const rejected: QueueItem[] = [];
+
+      for (const file of files) {
+        const key = makeKey();
+        const validation = validateFile(file);
+        const duplicate = validation
+          ? undefined
+          : history.find(
+              (entry) =>
+                (entry.source_name || "").toLowerCase() === file.name.toLowerCase() &&
+                entry.source_bytes === file.size &&
+                (entry.available_stems || 0) > 0,
+            );
+        if (validation) {
+          rejected.push({
+            key,
+            file: null,
+            name: file.name,
+            size: file.size,
+            state: "error",
+            uploadPct: 0,
+            error: validation,
+          });
+          continue;
+        }
+        accepted.push({
+          key,
+          file,
+          name: file.name,
+          size: file.size,
+          state: duplicate ? "confirm" : "waiting",
+          uploadPct: 0,
+          duplicateOf: duplicate?.job_id,
+          error: duplicate
+            ? `${formatClock(duplicate.finished_at || duplicate.created_at)} 已经分离过，${duplicate.available_stems} 条音轨还在本机。`
+            : null,
+        });
+      }
+
+      if (accepted.length) setSelectedKey(accepted[accepted.length - 1].key);
+      setItems((current) => [...current, ...rejected, ...accepted]);
+    },
+    [history],
   );
 
   const handleInputChange = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
-      const file = event.currentTarget.files?.[0];
+      const files = Array.from(event.currentTarget.files || []);
       event.currentTarget.value = "";
-      if (file) void handleFile(file);
+      if (files.length) enqueue(files);
     },
-    [handleFile],
+    [enqueue],
   );
 
   const handleDragEnter = useCallback((event: React.DragEvent) => {
@@ -345,92 +611,154 @@ export function VocalWorkspace() {
       dragDepthRef.current = 0;
       setIsDragging(false);
       if (serviceState !== "online") {
-        setError("本地 AI 服务尚未就绪，请先重新检测。");
-        setStatus("error");
+        setNotice("本地 AI 服务尚未就绪，请先看上面的提示。");
         return;
       }
-      const file = event.dataTransfer.files[0];
-      if (file) void handleFile(file);
+      const files = Array.from(event.dataTransfer.files || []);
+      if (files.length) enqueue(files);
     },
-    [handleFile, serviceState],
+    [enqueue, serviceState],
   );
 
-  const handleReset = useCallback(() => {
-    requestSequenceRef.current += 1;
-    uploadControllerRef.current?.abort();
-    setStatus("idle");
-    setProgress(0);
-    setFileName(null);
-    setError(null);
-    setResult(null);
-    setDownloading(null);
-    currentJobIdRef.current = null;
+  const removeItem = useCallback((key: string) => {
+    abandonRef.current.add(key);
+    setItems((current) => current.filter((entry) => entry.key !== key));
+    setSelectedKey((current) => (current === key ? null : current));
   }, []);
 
-  const handleCancel = useCallback(async () => {
-    const jobId = currentJobIdRef.current;
-    requestSequenceRef.current += 1;
-    uploadControllerRef.current?.abort();
-    currentJobIdRef.current = null;
-    setStatus("idle");
-    setProgress(0);
-    setFileName(null);
-    setError(null);
-    setResult(null);
-
-    if (!jobId) return;
-    try {
-      const response = await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, {
-        method: "POST",
-      });
-      if (!response.ok && response.status !== 409) {
-        throw new Error(await getErrorMessage(response));
+  const cancelItem = useCallback(
+    async (key: string, jobId?: string) => {
+      abandonRef.current.add(key);
+      patch(key, { state: "cancelled" });
+      if (!jobId) return;
+      try {
+        const response = await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "POST" });
+        if (!response.ok && response.status !== 409 && response.status !== 404) {
+          throw new Error(await getErrorMessage(response));
+        }
+      } catch (cancelError) {
+        patch(key, { error: friendlyError(cancelError, "任务取消失败，请稍后重试。") });
       }
-    } catch (cancelError) {
-      setError(friendlyError(cancelError, "任务取消失败，请稍后重试。"));
-      setStatus("error");
+    },
+    [patch],
+  );
+
+  const startDuplicate = useCallback(
+    (key: string) => {
+      abandonRef.current.delete(key);
+      patch(key, { state: "waiting", error: null, duplicateOf: undefined });
+    },
+    [patch],
+  );
+
+  const loadHistoryEntry = useCallback(async (entry: HistoryEntry) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/jobs/${entry.job_id}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await getErrorMessage(response));
+      const job = (await response.json()) as JobSnapshot;
+      const key = makeKey();
+      setItems((current) => [
+        ...current,
+        {
+          key,
+          file: null,
+          name: job.source_name || entry.source_name || "已分离结果",
+          size: entry.source_bytes || 0,
+          state: "done",
+          uploadPct: 100,
+          job: { ...job, source_name: job.source_name || entry.source_name },
+        },
+      ]);
+      setSelectedKey(key);
+    } catch (loadError) {
+      setNotice(
+        `这条结果的任务记录已经不在了（${friendlyError(loadError, "任务不存在或已过期")}），文件路径：${entry.output_dir || "未知"}`,
+      );
     }
   }, []);
 
-  const downloadStem = useCallback(
-    async (jobId: string, stemKey: string, meta: StemMeta) => {
-      setDownloading(stemKey);
-      setError(null);
+  const exportStem = useCallback(
+    async (
+      jobId: string,
+      stemKey: string,
+      label: string,
+      sourceName: string | null,
+      viaDialog: boolean,
+    ) => {
+      const baseName = (sourceName || "声析音轨").replace(/\.[^.]+$/, "");
+      const suggestedName = `${baseName}-${stemKey}.wav`;
+      const shell = shellApi();
+
+      if (viaDialog && shell?.saveStem) {
+        setSaving(stemKey);
+        setNotice(null);
+        const result = await shell.saveStem({ jobId, stem: stemKey, suggestedName });
+        setSaving(null);
+        if (result.saved && result.path) {
+          setNotice(`已保存：${result.path}（${formatSize(result.bytes)}）`);
+        } else if (result.reason && result.reason !== "cancelled") {
+          setNotice(result.reason);
+        }
+        return;
+      }
+
+      setSaving(stemKey);
+      setNotice(null);
       try {
         const response = await fetch(
           `${API_BASE}/api/download/${jobId}/${encodeURIComponent(stemKey)}`,
         );
         if (!response.ok) throw new Error(await getErrorMessage(response));
-
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
         anchor.href = url;
-        const baseName = fileName?.replace(/\.[^.]+$/, "") || "声析音轨";
-        anchor.download = `${baseName}-${meta.fileLabel}.wav`;
+        anchor.download = `${baseName}-${label}.wav`;
         document.body.append(anchor);
         anchor.click();
         anchor.remove();
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
       } catch (downloadError) {
-        setError(
-          friendlyError(downloadError, "下载失败，请稍后重试。"),
-        );
+        setNotice(friendlyError(downloadError, "下载失败，请稍后重试。"));
       } finally {
-        setDownloading(null);
+        setSaving(null);
       }
     },
-    [fileName],
+    [],
   );
 
-  const isBusy = status === "uploading" || status === "processing";
-  const uploadDisabled = serviceState !== "online";
-  const isVideoFile = fileName ? VIDEO_EXTENSIONS.has(getExtension(fileName)) : false;
-  const visibleStems = result
-    ? STEM_ORDER.flatMap((stemKey) => {
-        const stem = result.stems[stemKey];
-        return stem ? [[stemKey, stem] as const] : [];
-      })
+  const activeItem = items.find(
+    (entry) => entry.state === "uploading" || entry.state === "processing",
+  );
+  const lastDone = [...items].reverse().find((entry) => entry.state === "done");
+  const shown =
+    items.find((entry) => entry.key === selectedKey) || activeItem || lastDone || null;
+  const shownJob = shown?.job;
+  const shownSource = shown?.name || shownJob?.source_name || null;
+  const busyItem = activeItem || null;
+  const queueIsFull = items.length > 0;
+  const visibleStems = (() => {
+    const stems = shownJob?.stems;
+    if (!stems || shown?.state !== "done") return [];
+    const keys = Object.keys(stems).sort(
+      (a, b) => (STEM_ORDER.indexOf(a) + 1 || 99) - (STEM_ORDER.indexOf(b) + 1 || 99),
+    );
+    return keys.map((key) => [key, stems[key]] as const);
+  })();
+
+  const isDesktop = !!shellApi()?.saveStem;
+  const environment = health
+    ? [
+        health.demucs_version ? `Demucs ${health.demucs_version}` : "Demucs 版本未知",
+        health.torch_version ? `torch ${health.torch_version}` : null,
+        health.cuda_available
+          ? health.cuda_device_name || "GPU 可用"
+          : "CPU 运行（较慢）",
+        health.ffmpeg_available ? "ffmpeg 可用" : "ffmpeg 缺失（视频读不了）",
+        health.model_cache?.cached
+          ? `模型权重已缓存 ${formatSize((health.model_cache.size_mb || 0) * 1024 * 1024)}`
+          : "模型权重未缓存（首次分离会先下载）",
+      ].filter(Boolean)
     : [];
 
   return (
@@ -442,7 +770,9 @@ export function VocalWorkspace() {
         <CardHeader className="workspace-header drag-region flex w-full flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
           <div className="flex min-w-0 flex-1 flex-col gap-1">
             <CardTitle as="h2" className="text-lg">新建分离任务</CardTitle>
-            <CardDescription>添加音频或视频，自动生成 4 条 WAV 音轨。</CardDescription>
+            <CardDescription>
+              可一次拖入多首，本机按顺序处理，输出 WAV 音轨。
+            </CardDescription>
           </div>
           <WindowControls />
           <button
@@ -476,65 +806,23 @@ export function VocalWorkspace() {
           </span>
         </CardHeader>
 
-        {(status === "idle" || status === "error") && (
-          <CardContent className="flex flex-col gap-4">
-            <button
-              type="button"
-              className={cn("upload-zone", isDragging && "is-dragging")}
-              onClick={() => fileInputRef.current?.click()}
-              onDragEnter={handleDragEnter}
-              onDragOver={(event) => event.preventDefault()}
-              onDragLeave={handleDragLeave}
-              onDrop={handleDrop}
-              aria-describedby="upload-help"
-              disabled={uploadDisabled}
-            >
-              <span className="upload-disc" aria-hidden="true">
-                <span className="wave-bars">
-                  {[18, 32, 48, 26, 54, 36, 22].map((height, index) => (
-                    <span
-                      key={`${height}-${index}`}
-                      style={{ height: `${height}%` }}
-                    />
-                  ))}
+        <CardContent className="flex flex-col gap-4 py-0">
+          {serviceState === "online" && environment.length > 0 && (
+            <p className="env-strip">
+              <Cpu aria-hidden="true" />
+              <span>{environment.join(" · ")}</span>
+              {typeof health?.active_jobs === "number" && health.active_jobs > 0 && (
+                <span className="env-strip-extra">
+                  （{health.active_jobs} 个任务在跑）
                 </span>
-              </span>
-              <span className="flex flex-col gap-2">
-                <span className="font-heading text-lg font-medium text-foreground">
-                  {uploadDisabled
-                    ? "等待本地 AI 服务"
-                    : isDragging
-                      ? "松开即可添加音频"
-                      : "拖入音频，或点击选择"}
-                </span>
-                <span
-                  id="upload-help"
-                  className="text-sm leading-6 text-muted-foreground"
-                >
-                  音频：MP3、WAV、FLAC、OGG、M4A、AAC
-                  <br />
-                  视频：MP4、MOV、MKV、WebM、AVI（自动提取音频）
-                  <br />
-                  最大 500 MB
-                </span>
-              </span>
-              <span className="upload-action">
-                <Upload aria-hidden="true" />
-                {uploadDisabled ? "暂不可用" : "选择音频"}
-              </span>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.mp4,.mov,.mkv,.webm,.avi"
-              className="hidden"
-              onChange={handleInputChange}
-              tabIndex={-1}
-            />
+              )}
+            </p>
+          )}
 
-            {uploadDisabled && (
-              <div className="service-notice" data-state={serviceState} role="status">
-                <span className="flex min-w-0 items-start gap-2">
+          {serviceState !== "online" && (
+            <div className="service-notice" data-state={serviceState} role="status">
+              <span className="flex min-w-0 flex-col gap-1">
+                <span className="flex items-start gap-2">
                   {serviceState === "checking" ? (
                     <LoaderCircle className="service-spinner" aria-hidden="true" />
                   ) : serviceState === "missing" ? (
@@ -544,69 +832,267 @@ export function VocalWorkspace() {
                   )}
                   <span>
                     {serviceState === "checking" && "正在启动本地 AI 服务，请稍候。"}
-                    {serviceState === "offline" && "本地 AI 服务未连接，请重新检测。"}
-                    {serviceState === "missing" && "未检测到 Demucs 音轨分离模型。"}
+                    {serviceState === "offline" && "本地 AI 服务未连接，界面无法提交任务。"}
+                    {serviceState === "missing" && "这个 Python 环境里没有 Demucs，界面只能检测不能分离。"}
                   </span>
                 </span>
-                <Button
+                {serviceState === "offline" && (
+                  <code className="command-text">
+                    {isDesktop ? "桌面版会自动启动后端；浏览器模式请双击 start.bat 或执行 python backend/main.py" : "python backend/main.py"}
+                  </code>
+                )}
+                {serviceState === "missing" && (
+                  <code className="command-text">python -m pip install -r backend/requirements.txt</code>
+                )}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={serviceState === "checking"}
+                onClick={() => void checkService()}
+              >
+                <RefreshCw data-icon="inline-start" />
+                重新检测
+              </Button>
+            </div>
+          )}
+
+          {presets.length > 0 && (
+            <div className="preset-picker" role="radiogroup" aria-label="音轨预设">
+              {presets.map((entry) => (
+                <button
+                  key={entry.preset}
                   type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={serviceState === "checking"}
-                  onClick={() => void checkService()}
+                  role="radio"
+                  aria-checked={preset === entry.preset}
+                  data-state={preset === entry.preset ? "on" : "off"}
+                  className="preset-option"
+                  onClick={() => setPresetChoice(entry.preset)}
+                  disabled={!!busyItem && preset !== entry.preset}
                 >
-                  <RefreshCw data-icon="inline-start" />
-                  重新检测
-                </Button>
-              </div>
-            )}
-
-            {error && (
-              <p className="error-message" role="alert">
-                <TriangleAlert aria-hidden="true" />
-                <span>{error}</span>
-              </p>
-            )}
-          </CardContent>
-        )}
-
-        {isBusy && (
-          <CardContent className="flex flex-col gap-6 py-5">
-            <div className="processing-visual" aria-hidden="true">
-              <AudioLines />
-              <span className="processing-ring" />
+                  <span className="preset-label">{entry.label}</span>
+                  <span className="preset-tracks">
+                    {entry.stems.map((stem) => stem.label_zh).join(" / ")}
+                  </span>
+                  <span className="preset-desc">{entry.description}</span>
+                </button>
+              ))}
             </div>
-            <div className="flex flex-col items-center gap-2 text-center">
-              <p className="font-heading text-xl font-medium text-balance">
-                {status === "uploading"
-                  ? "正在读取音频"
-                  : isVideoFile
-                    ? "正在提取音频并拆分音轨"
-                    : "正在拆分四条音轨"}
-              </p>
-              <p className="max-w-full truncate text-sm text-muted-foreground">
-                {fileName}
-              </p>
-            </div>
-            <Progress value={progress} aria-label="处理进度">
-              <ProgressLabel>
-                {status === "uploading"
-                  ? "正在读取音频"
-                  : isVideoFile
-                    ? "正在提取音频并分离"
-                    : "Demucs 正在处理"}
-              </ProgressLabel>
-              <ProgressValue>
-                {(_, value) => `${Math.round(value ?? 0)}%`}
-              </ProgressValue>
-            </Progress>
-            <p className="text-center text-xs leading-5 text-muted-foreground text-pretty">
-              处理时间取决于音频长度与显卡性能，请保持声析运行。
+          )}
+          {busyItem && presets.length > 0 && (
+            <p className="preset-lock">
+              队列在按 <strong>{presets.find((entry) => entry.preset === preset)?.label}</strong>{" "}
+              处理，改预设从下一首开始生效；正在跑的这首不会重来。
             </p>
-          </CardContent>
-        )}
+          )}
 
-        {status === "done" && result && (
+          <button
+            type="button"
+            className={cn("upload-zone", isDragging && "is-dragging", queueIsFull && "upload-zone-compact")}
+            onClick={() => fileInputRef.current?.click()}
+            onDragEnter={handleDragEnter}
+            onDragOver={(event) => event.preventDefault()}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            aria-describedby="upload-help"
+            disabled={serviceState !== "online"}
+          >
+            <span className="upload-disc" aria-hidden="true">
+              <span className="wave-bars">
+                {[18, 32, 48, 26, 54, 36, 22].map((height, index) => (
+                  <span
+                    key={`${height}-${index}`}
+                    style={{ height: `${height}%` }}
+                  />
+                ))}
+              </span>
+            </span>
+            <span className="flex flex-col gap-2">
+              <span className="font-heading text-lg font-medium text-foreground">
+                {serviceState !== "online"
+                  ? "等待本地 AI 服务"
+                  : isDragging
+                    ? "松开即可加入队列"
+                    : "拖入音频，或点击选择（可多选）"}
+              </span>
+              <span
+                id="upload-help"
+                className="text-sm leading-6 text-muted-foreground"
+              >
+                音频：MP3、WAV、FLAC、OGG、M4A、AAC
+                <br />
+                视频：MP4、MOV、MKV、WebM、AVI（自动提取音频）
+                <br />
+                最大 500 MB，结果在本机保留 1 小时
+              </span>
+            </span>
+            <span className="upload-action">
+              <Upload aria-hidden="true" />
+              {serviceState !== "online" ? "暂不可用" : "选择音频"}
+            </span>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.mp4,.mov,.mkv,.webm,.avi"
+            className="hidden"
+            onChange={handleInputChange}
+            tabIndex={-1}
+          />
+
+          {items.length > 0 && (
+            <ul className="queue-list" aria-label="分离队列">
+              {items.map((item) => {
+                const job = item.job;
+                const percent =
+                  item.state === "uploading"
+                    ? item.uploadPct
+                    : Math.round(job?.progress ?? 0);
+                return (
+                  <li key={item.key} className="queue-row" data-state={item.state}>
+                    <button
+                      type="button"
+                      className="queue-main"
+                      onClick={() => setSelectedKey(item.key)}
+                      disabled={item.state !== "done"}
+                      aria-label={`查看 ${item.name} 的结果`}
+                    >
+                      <span className="queue-name">{item.name}</span>
+                      <span className="queue-meta">
+                        {item.state === "confirm" && "重复：已分离过"}
+                        {item.state === "waiting" && "排队中"}
+                        {item.state === "uploading" && `上传 ${percent}%`}
+                        {item.state === "processing" &&
+                          `${job?.phase_label || "处理中"} ${percent}%${
+                            job?.eta_seconds != null ? ` · 约剩 ${formatDuration(job.eta_seconds)}` : ""
+                          }${
+                            job?.elapsed_seconds != null
+                              ? ` · 已用 ${formatDuration(job.elapsed_seconds)}`
+                              : ""
+                          }${(job?.queue_position || 0) > 0 ? ` · 前面还有 ${job?.queue_position} 首` : ""}`}
+                        {item.state === "done" && `完成 · ${visibleStemCount(item)} 条音轨`}
+                        {item.state === "error" && "失败"}
+                        {item.state === "cancelled" && "已取消"}
+                      </span>
+                    </button>
+                    <div className="queue-actions">
+                      {item.state === "confirm" && (
+                        <>
+                          <Button size="sm" variant="outline" onClick={() => void startDuplicate(item.key)}>
+                            仍然分离
+                          </Button>
+                          {item.duplicateOf && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() =>
+                                void loadHistoryEntry(
+                                  history.find((entry) => entry.job_id === item.duplicateOf) || {
+                                    job_id: item.duplicateOf || "",
+                                    stems: [],
+                                  },
+                                )
+                              }
+                            >
+                              看上次结果
+                            </Button>
+                          )}
+                        </>
+                      )}
+                      {(item.state === "processing" || item.state === "uploading") && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => void cancelItem(item.key, item.job?.job_id)}
+                        >
+                          <X data-icon="inline-start" />
+                          取消
+                        </Button>
+                      )}
+                      {["done", "error", "cancelled"].includes(item.state) && (
+                        <Button size="sm" variant="ghost" onClick={() => removeItem(item.key)}>
+                          <X data-icon="inline-start" />
+                          移除
+                        </Button>
+                      )}
+                    </div>
+                    {item.error && (
+                      <p className="queue-error">
+                        {item.error}
+                        {remedyFor(item.error) && <span className="queue-remedy">{remedyFor(item.error)}</span>}
+                      </p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {busyItem && (
+            <div className="flex flex-col gap-3 py-1">
+              <div className="flex flex-col items-center gap-2 text-center">
+                <div className="processing-visual" aria-hidden="true">
+                  <AudioLines />
+                  <span className="processing-ring" />
+                </div>
+                <p className="font-heading text-xl font-medium text-balance">
+                  {busyItem.state === "uploading"
+                    ? `正在读取音频 ${busyItem.uploadPct}%`
+                    : busyItem.job?.phase_label || "正在拆分音轨"}
+                </p>
+                <p className="max-w-full truncate text-sm text-muted-foreground">
+                  {busyItem.name}
+                </p>
+              </div>
+              <Progress value={busyItem.state === "uploading" ? busyItem.uploadPct : Math.round(busyItem.job?.progress ?? 0)} aria-label="处理进度">
+                <ProgressLabel>
+                  {busyItem.state === "uploading"
+                    ? "上传到本地服务"
+                    : busyItem.job?.phase_label || "Demucs 正在处理"}
+                </ProgressLabel>
+                <ProgressValue>
+                  {(_, value) => `${Math.round(value ?? 0)}%`}
+                </ProgressValue>
+              </Progress>
+              <p className="text-center text-xs leading-5 text-muted-foreground text-pretty">
+                已用 {formatDuration(busyItem.job?.elapsed_seconds)}
+                {busyItem.job?.eta_seconds != null && ` · 预计剩余 ${formatDuration(busyItem.job?.eta_seconds)}`}
+                {typeof busyItem.job?.queue_position === "number" && busyItem.job.queue_position > 0
+                  ? ` · 前面还有 ${busyItem.job.queue_position} 首`
+                  : ""}
+                。耗时取决于音频长度与显卡，首次运行还要下载模型权重。
+              </p>
+            </div>
+          )}
+
+          {notice && (
+            <p className="service-notice" role="status">
+              <span className="flex min-w-0 items-start gap-2">
+                <Check aria-hidden="true" />
+                <span className="min-w-0 break-all">{notice}</span>
+              </span>
+              <Button size="sm" variant="ghost" onClick={() => setNotice(null)}>
+                知道了
+              </Button>
+            </p>
+          )}
+
+          {shownJob?.error && shown?.state === "error" && (
+            <p className="error-message" role="alert">
+              <TriangleAlert aria-hidden="true" />
+              <span>
+                {shownJob.error}
+                {remedyFor(shownJob.error) && (
+                  <span className="queue-remedy">{remedyFor(shownJob.error)}</span>
+                )}
+              </span>
+            </p>
+          )}
+        </CardContent>
+
+        {visibleStems.length > 0 && shownJob?.job_id && (
           <>
             <CardContent className="flex flex-col gap-5">
               <div className="success-summary" role="status" aria-live="polite">
@@ -614,22 +1100,22 @@ export function VocalWorkspace() {
                   <Check />
                 </span>
                 <div className="min-w-0">
-                  <p className="font-heading text-lg font-medium">四轨分离完成</p>
+                  <p className="font-heading text-lg font-medium">
+                    {presetLabel(presets, shownJob.preset)}完成
+                  </p>
                   <p className="truncate text-sm text-muted-foreground">
-                    {fileName}
+                    {shownSource}
+                    {shownJob.elapsed_seconds ? ` · 用时 ${formatDuration(shownJob.elapsed_seconds)}` : ""}
                   </p>
                 </div>
               </div>
 
               <div className="flex flex-col gap-2">
                 {visibleStems.map(([stemKey, stem]) => {
-                  const meta = STEM_META[stemKey] ?? {
-                    label: stemKey,
-                    fileLabel: stemKey,
-                    icon: Music2,
-                  };
+                  const meta = STEM_META[stemKey] || { label: stemKey, icon: Music2 };
                   const Icon = meta.icon;
-                  const audioUrl = `${API_BASE}/api/download/${result.job_id}/${stemKey}`;
+                  const label = stem.label || meta.label;
+                  const audioUrl = `${API_BASE}/api/download/${shownJob.job_id}/${encodeURIComponent(stemKey)}`;
 
                   return (
                     <article key={stemKey} className="stem-row">
@@ -641,39 +1127,31 @@ export function VocalWorkspace() {
                         <Icon />
                       </span>
                       <div className="min-w-0 flex-1">
-                        <h3 className="font-heading text-sm font-medium">
-                          {meta.label}
-                        </h3>
+                        <h3 className="font-heading text-sm font-medium">{label}</h3>
                         <p className="text-xs text-muted-foreground tabular-nums">
-                          WAV，{formatSize(stem.size_mb)}
+                          WAV，{formatSize(stem.bytes ?? (stem.size_mb || 0) * 1024 * 1024)}
                         </p>
                       </div>
                       <audio
                         controls
                         preload="none"
                         className="audio-player"
-                        aria-label={`试听${meta.label}`}
+                        aria-label={`试听${label}`}
                         src={audioUrl}
                       />
                       <Button
                         variant="outline"
-                        disabled={downloading === stemKey}
-                        aria-busy={downloading === stemKey}
-                        onClick={() =>
-                          void downloadStem(result.job_id, stemKey, meta)
-                        }
-                        aria-label={
-                          downloading === stemKey
-                            ? `正在下载${meta.label}`
-                            : `下载${meta.label}`
-                        }
+                        disabled={saving === stemKey}
+                        aria-busy={saving === stemKey}
+                        onClick={() => void exportStem(shownJob.job_id, stemKey, label, shownSource, isDesktop)}
+                        aria-label={saving === stemKey ? `正在导出${label}` : isDesktop ? `保存${label}` : `下载${label}`}
                       >
-                        {downloading === stemKey ? (
-                          "正在下载"
+                        {saving === stemKey ? (
+                          "正在导出"
                         ) : (
                           <>
                             <Download data-icon="inline-start" />
-                            下载
+                            {isDesktop ? "保存" : "下载"}
                           </>
                         )}
                       </Button>
@@ -682,41 +1160,110 @@ export function VocalWorkspace() {
                 })}
               </div>
 
-              {error && (
-                <p className="error-message" role="alert">
-                  <TriangleAlert aria-hidden="true" />
-                  <span>{error}</span>
-                </p>
+              {shownJob.output_dir && (
+                <div className="output-path">
+                  <span className="min-w-0 break-all">
+                    本机结果目录：{shownJob.output_dir}
+                  </span>
+                  {isDesktop && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void shellApi()?.revealPath?.(shownJob.output_dir || "")}
+                    >
+                      <FolderOpen data-icon="inline-start" />
+                      打开目录
+                    </Button>
+                  )}
+                </div>
               )}
             </CardContent>
             <CardFooter className="justify-between gap-4">
               <span className="hidden items-center gap-2 text-xs text-muted-foreground sm:flex">
                 <Headphones className="size-4" aria-hidden="true" />
-                可先试听，再按需下载
+                {isDesktop ? "可先试听，再选目录保存" : "可先试听，再按需下载"}
               </span>
-              <Button variant="ghost" onClick={handleReset}>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setItems((current) => current.filter((entry) => entry.state === "waiting" || entry.state === "processing" || entry.state === "uploading"));
+                  setSelectedKey(null);
+                  setNotice(null);
+                }}
+              >
                 <RefreshCw data-icon="inline-start" />
-                分离另一首
+                收起来，只留进行中的
               </Button>
             </CardFooter>
           </>
         )}
 
-        {status !== "done" && (
-          <CardFooter className="justify-between gap-4">
-            <span className="flex items-center gap-2 text-xs text-muted-foreground">
-              <FileAudio className="size-4" aria-hidden="true" />
-              {isBusy ? "处理中请保持声析运行" : "输出 4 条 WAV 音轨"}
-            </span>
-            {isBusy && (
-              <Button variant="ghost" onClick={() => void handleCancel()}>
-                <X data-icon="inline-start" />
-                取消任务
+        {!busyItem && (
+          <CardFooter className="flex-col items-stretch gap-3">
+            <div className="flex items-center justify-between gap-4">
+              <span className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                <FileAudio className="size-4" aria-hidden="true" />
+                {items.length > 0 ? `队列 ${items.length} 首` : "输出 WAV 音轨，结果保留 1 小时"}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setHistoryOpen((open) => !open);
+                  if (!historyOpen) void loadHistory();
+                }}
+                aria-expanded={historyOpen}
+              >
+                <History data-icon="inline-start" />
+                本机最近结果
               </Button>
+            </div>
+            {historyOpen && (
+              <ul className="history-list" aria-label="本机最近分离结果">
+                {history.length === 0 && (
+                  <li className="history-empty">还没有可查的历史：完成一次分离后会出现在这里。</li>
+                )}
+                {history.map((entry) => (
+                  <li key={entry.job_id} className="history-row">
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm">{entry.source_name || entry.job_id}</span>
+                      <span className="block truncate text-xs text-muted-foreground">
+                        <Clock3 className="inline size-3" aria-hidden="true" />{" "}
+                        {formatClock(entry.finished_at || entry.created_at)} ·{" "}
+                        {presetLabel(presets, entry.preset)} · {entry.stems.length} 轨 ·{" "}
+                        {formatSize(entry.total_bytes)}
+                        {entry.expired ? " · 文件已清理" : ""}
+                      </span>
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={entry.expired}
+                      onClick={() => void loadHistoryEntry(entry)}
+                    >
+                      载入试听
+                    </Button>
+                  </li>
+                ))}
+              </ul>
             )}
           </CardFooter>
         )}
       </Card>
     </section>
   );
+}
+
+function shellApi(): DesktopShell | null {
+  if (typeof window === "undefined") return null;
+  return ((window as unknown as { vocal?: DesktopShell }).vocal as DesktopShell) || null;
+}
+
+function presetLabel(presets: PresetInfo[], preset?: string) {
+  if (!preset) return "";
+  return presets.find((entry) => entry.preset === preset)?.label || preset;
+}
+
+function visibleStemCount(item: QueueItem) {
+  return Object.keys(item.job?.stems || {}).length;
 }

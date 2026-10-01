@@ -60,6 +60,73 @@ ipcMain.handle("window:toggle-maximize", () => {
 ipcMain.handle("window:close", () => mainWindow?.close());
 ipcMain.handle("window:is-maximized", () => !!mainWindow?.isMaximized());
 
+// ── 导出音轨：让用户自己选目录与文件名（浏览器模式只能用默认下载目录） ──
+const JOB_ID_PATTERN = /^[0-9a-f]{12}$/;
+const STEM_PATTERN = /^[a-z][a-z_]{0,19}$/;
+
+function fetchStemToFile(jobId, stem, destination) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        host: API_HOST,
+        port: API_PORT,
+        path: `/api/download/${jobId}/${encodeURIComponent(stem)}`,
+        method: "GET",
+        timeout: 120000,
+      },
+      (response) => {
+        if (response.statusCode !== 200) {
+          response.resume();
+          reject(new Error(`音轨文件读不到（HTTP ${response.statusCode}），可能已被自动清理。`));
+          return;
+        }
+        const stream = fs.createWriteStream(destination);
+        response.pipe(stream);
+        stream.on("finish", () => {
+          stream.close(() => resolve(fs.statSync(destination).size));
+        });
+        stream.on("error", (error) => {
+          fs.unlink(destination, () => {});
+          reject(error);
+        });
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("读取音轨超时")));
+    request.on("error", (error) => reject(error));
+    request.end();
+  });
+}
+
+ipcMain.handle("vocal:save-stem", async (_event, payload) => {
+  const jobId = String(payload?.jobId || "");
+  const stem = String(payload?.stem || "");
+  const suggested = String(payload?.suggestedName || "stem.wav").replace(/[\\/:*?"<>|]+/g, "-");
+  if (!JOB_ID_PATTERN.test(jobId) || !STEM_PATTERN.test(stem)) {
+    return { saved: false, reason: "参数不合法，未写入任何文件。" };
+  }
+
+  const target = await dialog.showSaveDialog(mainWindow, {
+    title: "保存音轨",
+    defaultPath: path.join(app.getPath("downloads"), suggested.endsWith(".wav") ? suggested : `${suggested}.wav`),
+    filters: [{ name: "WAV 音频", extensions: ["wav"] }],
+  });
+  if (target.canceled || !target.filePath) return { saved: false, reason: "cancelled" };
+
+  try {
+    const bytes = await fetchStemToFile(jobId, stem, target.filePath);
+    return { saved: true, path: target.filePath, bytes };
+  } catch (error) {
+    return { saved: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("vocal:reveal-path", (_event, targetPath) => {
+  const resolved = path.resolve(String(targetPath || ""));
+  if (!fs.existsSync(resolved)) return false;
+  shell.showItemInFolder(resolved);
+  return true;
+});
+
 function checkBackend(timeoutMs = 1500) {
   return new Promise((resolve) => {
     const request = http.get(

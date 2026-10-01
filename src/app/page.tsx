@@ -15,13 +15,13 @@ const CAPABILITIES = [
   },
   {
     icon: SlidersHorizontal,
-    title: "四条独立音轨",
+    title: "四条音轨或人声+伴奏",
     description: "标准 WAV 输出",
   },
   {
     icon: Cpu,
-    title: "支持 GPU 加速",
-    description: "自动调用显卡",
+    title: "有显卡就用显卡",
+    description: "CUDA 不可用时走 CPU",
   },
 ];
 
@@ -56,7 +56,8 @@ export default function Home() {
                 <span className="block">拆成四条音轨</span>
               </h1>
               <p className="max-w-md text-base leading-7 text-muted-foreground text-pretty">
-                分离人声、鼓组、贝斯和其他乐器，用于翻唱、混音、采样与练习。
+                默认拆成人声、鼓组、贝斯和其他乐器四条轨；只要伴奏时选
+                「人声 + 伴奏」两轨预设。用于翻唱、混音、采样与练习。
               </p>
             </div>
 

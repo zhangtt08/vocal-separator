@@ -602,6 +602,239 @@
     height: 2.25rem;
     opacity: 0.86;
   }
+
+  /* 本机环境条：版本与设备都取自后端实测值 */
+  .env-strip {
+    display: flex;
+    align-items: baseline;
+    gap: 0.45rem;
+    color: var(--muted-foreground);
+    font-size: 0.7rem;
+    line-height: 1.6;
+  }
+
+  .env-strip svg {
+    width: 0.85rem;
+    height: 0.85rem;
+    flex: none;
+    align-self: center;
+    color: var(--meter);
+  }
+
+  .env-strip-extra {
+    color: var(--signal);
+  }
+
+  .command-text {
+    overflow-wrap: anywhere;
+    border-radius: 0.5rem;
+    background: color-mix(in oklch, var(--background) 62%, transparent);
+    box-shadow: 0 0 0 1px var(--border);
+    padding: 0.2rem 0.45rem;
+    color: var(--foreground);
+    font-size: 0.7rem;
+  }
+
+  /* 音轨预设 */
+  .preset-picker {
+    display: grid;
+    gap: 0.5rem;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  }
+
+  .preset-option {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.15rem;
+    align-items: flex-start;
+    border-radius: 0.9rem;
+    background: color-mix(in oklch, var(--panel) 80%, transparent);
+    box-shadow: 0 0 0 1px var(--border);
+    padding: 0.6rem 0.75rem;
+    text-align: left;
+    transition-property: box-shadow, background-color;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+  }
+
+  .preset-option:hover:not(:disabled) {
+    background-color: color-mix(in oklch, var(--accent) 60%, var(--panel));
+  }
+
+  .preset-option[data-state="on"] {
+    background-color: color-mix(in oklch, var(--meter) 10%, var(--panel));
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--meter) 48%, transparent),
+      0 0 0 4px color-mix(in oklch, var(--meter) 10%, transparent);
+  }
+
+  .preset-option:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .preset-option:focus-visible {
+    outline: 3px solid color-mix(in oklch, var(--ring) 48%, transparent);
+    outline-offset: 2px;
+  }
+
+  .preset-label {
+    font-family: var(--font-heading, inherit);
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--foreground);
+  }
+
+  .preset-tracks {
+    font-size: 0.72rem;
+    color: var(--meter);
+  }
+
+  .preset-desc {
+    font-size: 0.68rem;
+    line-height: 1.5;
+    color: var(--muted-foreground);
+  }
+
+  .preset-lock {
+    font-size: 0.7rem;
+    line-height: 1.6;
+    color: var(--muted-foreground);
+  }
+
+  /* 队列 */
+  .upload-zone-compact {
+    min-height: 9.5rem;
+    gap: 0.75rem;
+  }
+
+  .upload-zone-compact .upload-disc {
+    width: 3.5rem;
+    height: 3.5rem;
+  }
+
+  .upload-zone-compact .wave-bars {
+    width: 1.9rem;
+    height: 1.9rem;
+  }
+
+  .queue-list,
+  .history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .queue-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.4rem 0.75rem;
+    border-radius: 0.85rem;
+    background: color-mix(in oklch, var(--panel) 74%, transparent);
+    box-shadow: 0 0 0 1px var(--border);
+    padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+  }
+
+  .queue-row[data-state="done"] {
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--meter) 34%, transparent);
+  }
+
+  .queue-row[data-state="error"],
+  .queue-row[data-state="confirm"] {
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--destructive) 34%, transparent);
+  }
+
+  .queue-row[data-state="confirm"] {
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--signal) 42%, transparent);
+  }
+
+  .queue-main {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.1rem;
+    text-align: left;
+    border-radius: 0.5rem;
+  }
+
+  .queue-main:disabled {
+    cursor: default;
+  }
+
+  .queue-main:not(:disabled):hover .queue-name {
+    color: var(--meter);
+  }
+
+  .queue-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.8rem;
+    color: var(--foreground);
+  }
+
+  .queue-meta {
+    font-size: 0.7rem;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .queue-actions {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .queue-error,
+  .queue-remedy {
+    grid-column: 1 / -1;
+    font-size: 0.7rem;
+    line-height: 1.55;
+    color: color-mix(in oklch, var(--destructive) 62%, white);
+  }
+
+  .queue-row[data-state="confirm"] .queue-error {
+    color: color-mix(in oklch, var(--signal) 66%, white);
+  }
+
+  .queue-remedy {
+    display: block;
+    margin-top: 0.15rem;
+    color: var(--muted-foreground);
+  }
+
+  .output-path {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    border-radius: 0.85rem;
+    background: color-mix(in oklch, var(--muted) 52%, transparent);
+    box-shadow: 0 0 0 1px var(--border);
+    padding: 0.45rem 0.5rem 0.45rem 0.7rem;
+    font-size: 0.68rem;
+    color: var(--muted-foreground);
+  }
+
+  .history-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    border-radius: 0.85rem;
+    background: color-mix(in oklch, var(--panel) 64%, transparent);
+    box-shadow: 0 0 0 1px var(--border);
+    padding: 0.5rem 0.6rem;
+  }
+
+  .history-empty {
+    font-size: 0.72rem;
+    color: var(--muted-foreground);
+    padding: 0.35rem 0.15rem;
+  }
 }
 
 @keyframes processing-spin {

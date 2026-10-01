@@ -9,6 +9,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test:backend": "python -m unittest discover -s backend -v",
+    "agent:serve": "python agent/server.py",
+    "agent:mcp": "node agent/mcp-server.mjs",
     "desktop": "npm run build && electron .",
     "desktop:dir": "npm run build && electron-builder --win dir",
     "desktop:pack": "npm run build && electron-builder --win portable"
@@ -59,8 +62,17 @@
         "to": "backend",
         "filter": [
           "main.py",
+          "agent_api.py",
           "requirements.txt",
           "ffmpeg.exe"
+        ]
+      },
+      {
+        "from": "agent",
+        "to": "agent",
+        "filter": [
+          "tools.py",
+          "errors.py"
         ]
       },
       {

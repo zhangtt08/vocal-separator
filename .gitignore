@@ -44,11 +44,22 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# backend 运行时（上传/输出自动清理；ffmpeg 二进制体积大，本机保留）
+# backend 运行时（上传/输出/历史索引自动清理；ffmpeg 二进制体积大，本机保留）
 backend/__pycache__/
 backend/uploads/
 backend/outputs/
+backend/history.json
 backend/ffmpeg.exe
 
-# 桌面打包产物（release/ 已忽略；保留安装包在本地）
-*.tsbuildinfo
+# Agent API 运行时产物（服务地址回执、字节码；都可再生）
+agent/.endpoint
+agent/__pycache__/
+
+# 任何位置的日志与临时抓取残留
+__pycache__/
+*.log
+/capture-*
+/ui-*.png
+
+# Windows 快捷方式（本机启动用，不入库）
+*.lnk

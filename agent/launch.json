@@ -1,0 +1,7 @@
+{
+  "command": "python",
+  "args": ["agent/server.py"],
+  "ready_port": 8000,
+  "base_url": "http://127.0.0.1:8000",
+  "note": "契约端点挂在常驻 FastAPI 后端上（只听 127.0.0.1:8000），本项目不新增端口；agent/server.py 只负责起来/报地址/写 .endpoint。"
+}

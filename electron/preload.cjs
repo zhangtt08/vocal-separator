@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("vocal", {
@@ -12,4 +13,7 @@ contextBridge.exposeInMainWorld("vocal", {
       return () => ipcRenderer.removeListener("vocal:maximized", h);
     },
   },
+  // 导出：主进程弹系统"另存为"，再把后端音轨写进用户选定的路径。
+  saveStem: (payload) => ipcRenderer.invoke("vocal:save-stem", payload),
+  revealPath: (targetPath) => ipcRenderer.invoke("vocal:reveal-path", targetPath),
 });
