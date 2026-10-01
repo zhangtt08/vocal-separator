@@ -32,7 +32,48 @@ function useMaximized(): boolean {
 const btn =
   "grid h-full w-11 place-items-center text-white/50 transition-colors hover:bg-white/10 hover:text-white";
 
-/** 自绘标题栏：拖拽移动 + 双击最大化 + 窗口三键（frameless 窗口下由本组件承担系统标题栏职责）。 */
+/** 窗口三键簇：嵌入应用自己的头部行。 */
+export function WindowControls() {
+  const maximized = useMaximized();
+  const s = shell();
+  if (!s) return null;
+  const btn =
+    "grid h-8 w-11 place-items-center text-white/50 transition-colors hover:bg-white/10 hover:text-white";
+  return (
+    <div className="flex items-center [-webkit-app-region:no-drag]">
+      <button aria-label="最小化" className={btn} onClick={() => void s.windowControls.minimize()} type="button">
+        <svg height="10" viewBox="0 0 10 10" width="10"><path d="M0 5h10" stroke="currentColor" strokeWidth="1" /></svg>
+      </button>
+      <button
+        aria-label={maximized ? "还原" : "最大化"}
+        className={btn}
+        onClick={() => void s.windowControls.toggleMaximize()}
+        type="button"
+      >
+        {maximized ? (
+          <svg height="10" viewBox="0 0 10 10" width="10">
+            <path d="M2.5 2.5V1h7v7H8" fill="none" stroke="currentColor" strokeWidth="1" />
+            <rect fill="none" height="6.5" stroke="currentColor" strokeWidth="1" width="6.5" x="0.5" y="2.5" />
+          </svg>
+        ) : (
+          <svg height="10" viewBox="0 0 10 10" width="10">
+            <rect fill="none" height="8" stroke="currentColor" strokeWidth="1" width="8" x="1" y="1" />
+          </svg>
+        )}
+      </button>
+      <button
+        aria-label="关闭"
+        className={`${btn} hover:bg-[#cf3f4f] hover:text-white`}
+        onClick={() => void s.windowControls.close()}
+        type="button"
+      >
+        <svg height="10" viewBox="0 0 10 10" width="10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor" strokeWidth="1" /></svg>
+      </button>
+    </div>
+  );
+}
+
+/** 独立标题条：仅在页面没有自己的头部行时兜底使用（当前布局已改为内嵌模式）。 */
 export function TitleBar() {
   const maximized = useMaximized();
   const s = shell();

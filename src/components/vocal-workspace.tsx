@@ -41,6 +41,7 @@ import {
   ProgressValue,
 } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
+import { WindowControls } from "@/components/TitleBar";
 
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
@@ -438,11 +439,12 @@ export function VocalWorkspace() {
       aria-label="音轨分离工作台"
     >
       <Card className="workspace-card">
-        <CardHeader className="workspace-header flex w-full flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
-          <div className="flex min-w-0 flex-col gap-1">
+        <CardHeader className="workspace-header drag-region flex w-full flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+          <div className="flex min-w-0 flex-1 flex-col gap-1">
             <CardTitle as="h2" className="text-lg">新建分离任务</CardTitle>
             <CardDescription>添加音频或视频，自动生成 4 条 WAV 音轨。</CardDescription>
           </div>
+          <WindowControls />
           <button
             type="button"
             className="service-status"

@@ -690,3 +690,13 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ── 桌面壳自绘标题栏：拖拽区（工作区卡片头）── */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.drag-region button,
+.drag-region a,
+.drag-region input {
+  -webkit-app-region: no-drag;
+}
