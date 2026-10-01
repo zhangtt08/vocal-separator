@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
-const { app, BrowserWindow, Menu, dialog, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const { execFile, spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -45,6 +45,20 @@ function getIconPath() {
 function getLogPath() {
   return path.join(app.getPath("logs"), "backend.log");
 }
+
+// ── 自绘标题栏窗口控制 ──
+ipcMain.handle("window:minimize", () => mainWindow?.minimize());
+ipcMain.handle("window:toggle-maximize", () => {
+  if (!mainWindow) return false;
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize();
+    return false;
+  }
+  mainWindow.maximize();
+  return true;
+});
+ipcMain.handle("window:close", () => mainWindow?.close());
+ipcMain.handle("window:is-maximized", () => !!mainWindow?.isMaximized());
 
 function checkBackend(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -331,13 +345,19 @@ function createWindow(rendererOrigin) {
     backgroundColor: "#071a20",
     icon: getIconPath(),
     show: false,
+    frame: false,
     webPreferences: {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
       webSecurity: true,
+      preload: path.join(__dirname, "preload.cjs"),
     },
   });
+
+  for (const ev of ["maximize", "unmaximize"]) {
+    mainWindow.on(ev, () => mainWindow?.webContents.send("vocal:maximized", ev === "maximize"));
+  }
 
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
