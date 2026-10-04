@@ -78,6 +78,9 @@ STEM_LABELS = {
     "no_vocals": {"zh": "伴奏", "en": "instrumental"},
 }
 
+# 任务状态里"被打断"专用一个阶段名，绝不复用 finished/failed 的措辞。
+INTERRUPTED_PHASE = "interrupted"
+
 PHASE_LABELS = {
     "queued": "排队等待",
     "loading_model": "加载模型",
@@ -88,6 +91,8 @@ PHASE_LABELS = {
     "finished": "已完成",
     "cancelled": "已取消",
     "failed": "失败",
+    # 服务重启把任务打断时专用：既不是"完成"也不是普通的"失败"，说清是没跑完。
+    INTERRUPTED_PHASE: "服务重启，未跑完",
 }
 
 # Demucs 一次跑满一张显卡才划算，所以分离槽位=1：后来的任务留在 queued 并给出排队位次。
@@ -99,11 +104,18 @@ ERROR_OUTPUT_TAIL = 12
 
 HISTORY_FILE_NAME = "history.json"
 HISTORY_LIMIT = 60
+# 任务表落盘：崩了/重启了不该把排队中和在跑的任务一起丢掉（验收的 MAJOR 之一）。
+QUEUE_FILE_NAME = "queue.json"
+QUEUE_KEEP_JOBS = 120
 
 jobs: dict[str, dict[str, Any]] = {}
 jobs_lock = threading.Lock()
 history_lock = threading.Lock()
+queue_lock = threading.Lock()
 cleanup_stop = threading.Event()
+# 开机恢复与清扫的报告（/api/health 的 data.recovery 就是它，界面上看得见"回收了什么"）。
+STARTUP_REPORT: dict[str, Any] = {"status": "not-run"}
+startup_report_lock = threading.Lock()
 
 _START_TIME = time.time()
 
@@ -499,11 +511,23 @@ def _probe_environment_in_background() -> None:
 # ────────────────────────────── 任务表 ──────────────────────────────
 
 
+# 任务表落盘的节流：状态/阶段一变就写，纯进度变化最多 2 秒写一次
+# （Demucs 一条任务能刷几百行进度，每行都重写一遍 JSON 是白给的磁盘活动）。
+_last_queue_persist = {"at": 0.0}
+
+
 def _update_job(job_id: str, **changes: Any) -> None:
     with jobs_lock:
         current = jobs.setdefault(job_id, {})
         current.update(changes)
-        current["updated_at"] = time.time()
+        now = time.time()
+        current["updated_at"] = now
+        structural = any(key in changes for key in ("status", "phase", "stems", "input_path", "preset"))
+        due = structural or (now - _last_queue_persist["at"]) >= 2.0
+        if due:
+            _last_queue_persist["at"] = now
+    if due:
+        persist_queue()
 
 
 def _queue_position(job_id: str) -> int:
@@ -619,6 +643,8 @@ def create_job(*, source_name: str, source_bytes: int, preset: str = DEFAULT_PRE
             "created_at": now,
             "updated_at": now,
         }
+    # 立刻就落盘：万一"刚排上队就断电"，开机恢复才有东西可恢复。
+    persist_queue()
     return job_id
 
 
@@ -687,8 +713,251 @@ def submit_source_file(source_path: Path, preset: str = DEFAULT_PRESET) -> tuple
             jobs.pop(job_id, None)
         destination.unlink(missing_ok=True)
         raise RuntimeError(f"复制输入文件失败：{exc}") from exc
+    _update_job(job_id, input_path=str(destination))
     launch_separation(job_id, destination)
     return job_id, destination
+
+
+# ────────────────────────────── 任务表落盘与开机恢复 ──────────────────────────────
+
+
+def queue_path() -> Path:
+    return DATA_DIR / QUEUE_FILE_NAME
+
+
+def _persistable(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    """任务表里能写进磁盘的那部分（子进程句柄、临时字段一律不进）。"""
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "phase": job.get("phase"),
+        "progress": job.get("progress", 0),
+        "preset": job.get("preset", DEFAULT_PRESET),
+        "stem_names": list(job.get("stem_names", STEM_NAMES)),
+        "source_name": job.get("source_name"),
+        "source_bytes": job.get("source_bytes"),
+        "output_dir": job.get("output_dir"),
+        "input_path": job.get("input_path"),
+        "stems": dict(job.get("stems", {})),
+        "error": job.get("error"),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "created_at": job.get("created_at", 0),
+        "running_at": job.get("running_at"),
+        "finished_at": job.get("finished_at"),
+        "updated_at": job.get("updated_at", 0),
+    }
+
+
+def persist_queue() -> bool:
+    """把当前任务表原子写进 queue.json。"""
+    with jobs_lock:
+        records = [_persistable(job_id, job) for job_id, job in jobs.items()]
+    records.sort(key=lambda record: record.get("updated_at") or 0)
+    if len(records) > QUEUE_KEEP_JOBS:
+        records = records[-QUEUE_KEEP_JOBS:]
+    target = queue_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({"version": 1, "saved_at": time.time(), "jobs": records}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+        return True
+    except OSError:
+        return False  # 落盘失败不能让正在跑的分离停下来；重启会少一条恢复记录而已
+
+
+def load_queue_records() -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(queue_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(payload, dict):
+        records = payload.get("jobs")
+    elif isinstance(payload, list):  # 早期形状（万一有）：只认列表，不猜
+        records = payload
+    else:
+        return []
+    return [record for record in records if isinstance(record, dict) and record.get("job_id")] if isinstance(records, list) else []
+
+
+def _interrupted_reason(missing_input: bool) -> str:
+    if missing_input:
+        return (
+            "服务在这一点重启过，这个任务当时还没跑完，而且它要的输入文件已经不在了 —— "
+            "没有把它记成完成。请重新提交这首歌。"
+        )
+    return (
+        "服务在这个任务运行中重启了。它没有被记成完成，也没有自动重跑（避免在你没看着的时候"
+        "占住显卡）。输入文件还在，重新提交即可。"
+    )
+
+
+def recover_jobs_on_startup() -> dict[str, Any]:
+    """开机把 queue.json 读回来：没跑完的要么重投、要么如实标成"被打断"。
+
+    判据是"绝不说谎"：曾经 processing/queued 的任务永远不会被恢复成 done，
+    也不会悄悄写进 history.json。曾经排队、输入文件还在的，重新开工；
+    正在跑的（半成品由 sweep_partial_outputs() 回收）标成 interrupted。
+    """
+    records = load_queue_records()
+    report: dict[str, Any] = {
+        "status": "ok",
+        "loaded": len(records),
+        "requeued": [],
+        "interrupted": [],
+        "restored_terminal": 0,
+        "skipped": [],
+    }
+    now = time.time()
+    for record in records:
+        job_id = str(record.get("job_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{12}", job_id):
+            report["skipped"].append({"job_id": job_id, "reason": "编号不合法"})
+            continue
+        status = record.get("status")
+        input_path = Path(str(record.get("input_path") or ""))
+        has_input = input_path.is_file()
+        job = {
+            key: value
+            for key, value in record.items()
+            if key not in {"job_id"}
+        }
+        job.setdefault("created_at", now)
+        job.setdefault("updated_at", now)
+        job.setdefault("stem_names", list(PRESETS.get(str(job.get("preset") or DEFAULT_PRESET), PRESETS[DEFAULT_PRESET])["stems"]))
+        with jobs_lock:
+            if job_id in jobs:  # 内存里已经有（同进程内重建），不覆盖
+                continue
+            jobs[job_id] = job
+
+        if status in {"queued", "processing", "cancelling"}:
+            if status == "queued" and has_input:
+                job["status"] = "queued"
+                job["phase"] = "queued"
+                job["error"] = None
+                job["cancel_requested"] = False
+                report["requeued"].append(job_id)
+                launch_separation(job_id, input_path)
+                continue
+            job.update(
+                {
+                    "status": "error",
+                    "phase": INTERRUPTED_PHASE,
+                    "progress": 0,
+                    "error": _interrupted_reason(not has_input),
+                    "cancel_requested": False,
+                    "stems": {},
+                    "finished_at": now,
+                }
+            )
+            report["interrupted"].append({"job_id": job_id, "was": status, "had_input": has_input})
+        else:
+            report["restored_terminal"] += 1
+    if report["requeued"] or report["interrupted"] or report["loaded"]:
+        persist_queue()
+    return report
+
+
+def _directory_bytes(directory: Path) -> int:
+    total = 0
+    for item in directory.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def sweep_partial_outputs() -> dict[str, Any]:
+    """开机回收"没有主人的"输出目录与输入文件，并把回收了什么如实报出来。
+
+    以前半成品要等到 3600 秒的 TTL 清扫才走，期间占着盘也没人说什么；
+    现在服务一起来就按任务表点名：不在表里、或对应任务没成功留下音轨的，收走。
+    """
+    reclaimed: list[dict[str, Any]] = []
+    with jobs_lock:
+        live = {job_id: dict(job) for job_id, job in jobs.items()}
+    active = {"queued", "processing", "cancelling"}
+
+    for directory in sorted(OUTPUTS_DIR.iterdir()) if OUTPUTS_DIR.is_dir() else []:
+        if not directory.is_dir():
+            continue
+        job_id = directory.name
+        job = live.get(job_id)
+        if job is not None and (
+            job.get("status") in active or (job.get("status") == "done" and job.get("stems"))
+        ):
+            continue  # 还在排/还在跑的由它自己收尾；成功的成果更不该在开机时被收走
+        size = _directory_bytes(directory)
+        _remove_quiet(directory)
+        reclaimed.append(
+            {
+                "kind": "output",
+                "path": str(directory),
+                "job_id": job_id if re.fullmatch(r"[0-9a-f]{12}", job_id) else None,
+                "bytes": size,
+                "reason": "任务表里没有这个输出目录的主人" if job is None else "对应任务没有成功留下音轨",
+            }
+        )
+
+    for file_path in sorted(UPLOADS_DIR.iterdir()) if UPLOADS_DIR.is_dir() else []:
+        if not file_path.is_file():
+            continue
+        job_id = file_path.stem
+        job = live.get(job_id)
+        if job is not None and job.get("status") in active:
+            continue  # 排队/在跑的任务还要用它
+        if job is not None and job.get("status") == "done":
+            continue  # 正常收尾会删；留着就别在开机时抢着删
+        size = 0
+        try:
+            size = file_path.stat().st_size
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        reclaimed.append(
+            {
+                "kind": "upload",
+                "path": str(file_path),
+                "job_id": job_id if re.fullmatch(r"[0-9a-f]{12}", job_id) else None,
+                "bytes": size,
+                "reason": "输入文件已经没有对应的活动任务",
+            }
+        )
+
+    report = {
+        "items": reclaimed,
+        "dirs": sum(1 for item in reclaimed if item["kind"] == "output"),
+        "uploads": sum(1 for item in reclaimed if item["kind"] == "upload"),
+        "bytes": sum(int(item["bytes"]) for item in reclaimed),
+    }
+    return report
+
+
+def startup_report() -> dict[str, Any]:
+    with startup_report_lock:
+        return json.loads(json.dumps(STARTUP_REPORT))
+
+
+def record_startup_report(recovery: dict[str, Any], swept: dict[str, Any]) -> dict[str, Any]:
+    report = {**recovery, "swept": swept, "reported_at": time.time()}
+    with startup_report_lock:
+        STARTUP_REPORT.clear()
+        STARTUP_REPORT.update(report)
+    if swept["items"] or recovery.get("interrupted") or recovery.get("requeued"):
+        print(
+            "[vocal] 开机恢复："
+            f"读回 {report['loaded']} 条任务，重新排队 {len(report['requeued'])} 条，"
+            f"标记被打断 {len(report['interrupted'])} 条；"
+            f"回收半成品 {swept['dirs']} 个输出目录 + {swept['uploads']} 个输入文件，"
+            f"共 {round(swept['bytes'] / 1_048_576, 1)} MB。",
+            flush=True,
+        )
+    return report
 
 
 # ────────────────────────────── 历史输出索引 ──────────────────────────────
@@ -828,7 +1097,10 @@ def cleanup_old_files(max_age_seconds: int = FILE_TTL_SECONDS) -> None:
         ]
         for job_id in expired:
             jobs.pop(job_id, None)
+        dropped = len(expired)
 
+    if dropped:
+        persist_queue()
     prune_history()
 
 
@@ -1046,6 +1318,8 @@ def run_separation(job_id: str, input_path: Path) -> None:
     """在后台线程中运行 Demucs，并把结果写入任务独占目录。"""
     work_dir = OUTPUTS_DIR / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    # 记下输入文件：开机恢复要靠它判断"这个任务还能不能重投"。
+    _update_job(job_id, input_path=str(input_path))
     if _job_cancel_requested(job_id):
         _remove_quiet(work_dir)
         _remove_quiet(input_path)
@@ -1263,6 +1537,9 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 先把任务表读回来（排队且输入还在的重新开工，跑过一半的如实标"被打断"），
+    # 再按读回来的表回收半成品输出 —— 顺序反了就会把刚要续跑的东西删掉。
+    record_startup_report(recover_jobs_on_startup(), sweep_partial_outputs())
     cleanup_old_files()
     _start_environment_probe()
     cleanup_stop.clear()
@@ -1330,6 +1607,7 @@ async def health() -> dict[str, Any]:
         "active_jobs": active_jobs,
         "presets": preset_descriptors(),
         "guard": local_guard.guard_state_for(DATA_DIR).describe(),
+        "recovery": startup_report(),
         **environment,
     }
     return payload
@@ -1408,7 +1686,7 @@ async def separate_audio(
             jobs.pop(job_id, None)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "音频文件为空")
 
-    _update_job(job_id, source_bytes=written)
+    _update_job(job_id, source_bytes=written, input_path=str(input_path))
     background_tasks.add_task(run_separation, job_id, input_path)
     return _public_job(job_id) or {"job_id": job_id, "status": "queued", "progress": 1}
 

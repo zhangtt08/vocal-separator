@@ -27,7 +27,8 @@ Separating vocals usually means uploading your audio to an online service and wa
 - **Recent results** — a persistent index (`backend/history.json`) lists past separations with real file sizes, so re-dropping the same file asks "already separated, run again?" instead of silently burning 10 minutes
 - **Export under your control** — preview in place; in the desktop app "保存" opens a real Save dialog (folder and filename yours), in the browser it downloads; the result directory is shown and can be opened
 - **Common formats in** — MP3 / WAV / FLAC / OGG / M4A / AAC, plus MP4 / MOV / MKV / WebM / AVI (FFmpeg extracts the audio first), up to 500 MB
-- **Self-cleaning** — uploads and outputs are wiped automatically after 1 hour; files you saved elsewhere are untouched
+- **Restart-safe queue** — the job table is written to `backend/queue.json` (atomic) and recovered on boot: a job that was still queued and whose upload survived is put back in line, a job that was mid-flight is marked 服务重启，未跑完 — never silently "succeeded" — and `GET /api/health` → `data.recovery` reports what was recovered and which partial output directories/uploads were reclaimed
+- **Self-cleaning** — partial output left by a crash is reclaimed at startup (with a report), and anything older than 1 hour is wiped; files you saved elsewhere are untouched
 - **Agent API + MCP** — the same service exposes `vocal.*` tools for local agents over `127.0.0.1:8000` (see below)
 
 ## 🚀 Quick Start
