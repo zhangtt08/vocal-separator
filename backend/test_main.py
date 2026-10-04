@@ -23,6 +23,10 @@ from fastapi.testclient import TestClient
 
 import main
 
+# 闸门只认回环 Host（local_guard 的判据），所以测试客户端也必须用它要打的那个地址：
+# 默认的 http://testserver 会被当成"不是本机"直接拒掉 —— 那正是这道闸门要做的事。
+LOOPBACK_BASE = "http://127.0.0.1:8000"
+
 
 class FakeDemucsProcess:
     """假 Demucs：按命令行里的 --two-stems 决定输出哪几条轨，并打印真实形状的进度。"""
@@ -88,28 +92,8 @@ class RecordingDemucsProcess(FakeDemucsProcess):
         super().__init__(command, **kwargs)
 
 
-class BackendTests(unittest.TestCase):
-    def test_cancelled_upload_leaves_no_file_or_queued_job(self):
-        class InterruptedUpload:
-            filename = "song.wav"
-            reads = 0
-            closed = False
-
-            async def read(self, _size):
-                self.reads += 1
-                if self.reads == 1:
-                    return b"partial audio"
-                raise asyncio.CancelledError
-
-            async def close(self):
-                self.closed = True
-
-        upload = InterruptedUpload()
-        with self.assertRaises(asyncio.CancelledError):
-            asyncio.run(main.separate_audio(main.BackgroundTasks(), upload, preset=None))
-        self.assertTrue(upload.closed)
-        self.assertEqual(list(self.uploads.iterdir()), [])
-        self.assertEqual(main.jobs, {})
+class ServiceSandbox:
+    """把 DATA_DIR / uploads / outputs 挪进临时目录：后端在测试里不碰真实工作目录。"""
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -138,10 +122,33 @@ class BackendTests(unittest.TestCase):
         self.uploads_patch.stop()
         self.temporary_directory.cleanup()
 
+class BackendTests(ServiceSandbox, unittest.TestCase):
+    def test_cancelled_upload_leaves_no_file_or_queued_job(self):
+        class InterruptedUpload:
+            filename = "song.wav"
+            reads = 0
+            closed = False
+
+            async def read(self, _size):
+                self.reads += 1
+                if self.reads == 1:
+                    return b"partial audio"
+                raise asyncio.CancelledError
+
+            async def close(self):
+                self.closed = True
+
+        upload = InterruptedUpload()
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(main.separate_audio(main.BackgroundTasks(), upload, preset=None))
+        self.assertTrue(upload.closed)
+        self.assertEqual(list(self.uploads.iterdir()), [])
+        self.assertEqual(main.jobs, {})
+
     # ────────────────────────── 原有链路 ──────────────────────────
 
     def test_rejects_invalid_inputs_and_download_paths(self):
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             self.assertEqual(client.get("/api/health").status_code, 200)
             self.assertEqual(
                 client.post(
@@ -280,7 +287,7 @@ class BackendTests(unittest.TestCase):
                 "updated_at": now,
             }
 
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             response = client.post(f"/api/jobs/{job_id}/cancel")
 
         self.assertEqual(response.status_code, 202)
@@ -339,7 +346,7 @@ class BackendTests(unittest.TestCase):
         job_id = self._finished_job("7b2c57000001", "vocal_backing")
         job = main.job_snapshot(job_id)
         self.assertEqual(set(job["stems"]), {"vocals", "no_vocals"})
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             self.assertEqual(client.get(f"/api/download/{job_id}/no_vocals").status_code, 200)
             # 这个预设根本没产出 drums：下载它必须是 404，而不是"文件不存在"含糊过关。
             self.assertEqual(client.get(f"/api/download/{job_id}/drums").status_code, 404)
@@ -347,7 +354,7 @@ class BackendTests(unittest.TestCase):
 
     def test_history_index_and_duplicate_lookup(self):
         job_id = self._finished_job("415708700001", "four_stems")
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             listed = client.get("/api/history").json()
             self.assertEqual(listed["total"], 1)
             entry = listed["items"][0]
@@ -365,12 +372,12 @@ class BackendTests(unittest.TestCase):
         import shutil
 
         shutil.rmtree(self.outputs / job_id, ignore_errors=True)
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             stale = client.get("/api/history", params={"name": "song.wav", "bytes": 4}).json()
             self.assertEqual(stale["total"], 0)
 
     def test_unknown_preset_is_rejected(self):
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             response = client.post(
                 "/api/separate",
                 files={"file": ("song.wav", b"RIFF", "audio/wav")},
@@ -551,7 +558,7 @@ class BackendTests(unittest.TestCase):
     # ────────────────────────── Agent API 契约 ──────────────────────────
 
     def test_health_carries_both_shapes(self):
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             payload = client.get("/api/health").json()
         # Electron 壳与 start.bat 读的旧键
         self.assertEqual(payload["status"], "ok")
@@ -566,7 +573,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual({entry["preset"] for entry in data["presets"]}, set(main.PRESETS))
 
     def test_agent_tools_and_manifest_envelopes(self):
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             tools = client.get("/api/agent/tools").json()
             manifest = client.get("/api/agent/manifest").json()
 
@@ -590,7 +597,7 @@ class BackendTests(unittest.TestCase):
         return client.post("/api/agent/tool", json={"tool": name, "input": argument})
 
     def test_agent_env_probe_returns_real_machine_facts(self):
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             response = self._tool(client, "vocal.env_probe", {"refresh": True})
             self.assertEqual(response.status_code, 200)
             data = response.json()["data"]
@@ -610,7 +617,7 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(data["status"], "probing")
 
     def test_agent_error_shapes(self):
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             missing = self._tool(client, "vocal.job_status", {})
             self.assertEqual(missing.status_code, 400)
             self.assertEqual(missing.json()["error"]["code"], "bad_input")
@@ -638,7 +645,7 @@ class BackendTests(unittest.TestCase):
 
     def test_agent_env_probe_treats_probing_as_retry_not_failure(self):
         """冷启动首呼是"探测中"，不是错误：要给出可轮询的 retry_after_seconds。"""
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             with patch.object(main, "probe_environment", return_value={"status": "probing"}):
                 body = self._tool(client, "vocal.env_probe", {}).json()
             self.assertTrue(body["ok"])
@@ -668,7 +675,7 @@ class BackendTests(unittest.TestCase):
                 }
             ],
         }
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             with patch.object(main, "probe_environment", return_value=blocked):
                 response = self._tool(
                     client, "vocal.separate_submit", {"input_path": str(source), "confirm": True}
@@ -683,7 +690,7 @@ class BackendTests(unittest.TestCase):
     def test_exec_tool_requires_explicit_confirm(self):
         source = self.root / "karaoke.flac"
         source.write_bytes(b"fAKE")
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             no_field = self._tool(client, "vocal.separate_submit", {"input_path": str(source)})
             self.assertEqual(no_field.status_code, 400)
             self.assertIn("confirm", no_field.json()["error"]["message"])
@@ -713,7 +720,7 @@ class BackendTests(unittest.TestCase):
 
     def test_agent_tools_read_write_against_real_files(self):
         job_id = self._finished_job("b017d1900001", "four_stems")
-        with TestClient(main.app) as client:
+        with TestClient(main.app, base_url=LOOPBACK_BASE) as client:
             status = self._tool(client, "vocal.job_status", {"job_id": job_id}).json()["data"]
             self.assertTrue(status["terminal"])
             self.assertEqual(status["status"], "done")

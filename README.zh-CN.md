@@ -47,7 +47,8 @@ npm run dev              # 前端 http://localhost:3000
 | 变量 | 作用 |
 | --- | --- |
 | `NEXT_PUBLIC_API_BASE_URL` | 前端指向别的后端地址 |
-| `VOCAL_SEPARATOR_ORIGINS` | 后端允许的前端来源（CORS），英文逗号分隔 |
+| `VOCAL_SEPARATOR_ORIGINS` | 后端允许的前端来源（CORS 与闸门共用这一份名单），英文逗号分隔 |
+| `VOCAL_SEPARATOR_TOKEN` | 共享令牌：设了之后所有非 GET 请求必须带 `x-vocal-token` |
 | `VOCAL_SEPARATOR_DATA_DIR` | 上传 / 输出 / history 存放目录（桌面版用自己的 userData） |
 | `VOCAL_SEPARATOR_PORT` | 后端端口，默认 `8000` |
 | `VOCAL_SEPARATOR_PYTHON` | 桌面壳用哪个 Python 起后端 |
@@ -56,10 +57,42 @@ npm run dev              # 前端 http://localhost:3000
 ## 检查
 
 ```powershell
+npm run verify      # 类型检查 + 后端单测 + 窗口控件测试 + 桌面壳闸门测试
 npm run lint
 npm run build
 python -m unittest discover -s backend -v   # 或 npm run test:backend
+npm run test:guard                          # 桌面壳 -> 后端这条第一方路径，端到端真跑
 ```
+
+## 只有本机能用 —— 具体到判据
+
+服务只听 `127.0.0.1`；在此之上每个请求还要过一道闸门（`backend/local_guard.py`，
+在 `backend/main.py` 里以中间件挂载，所以路由想漏也漏不掉）：
+
+1. **Host 钉死**：只接受 `127.0.0.1:端口` / `localhost:端口` / `[::1]:端口`，其余 JSON `403 host_forbidden`。
+   这一条挡的是 DNS rebinding —— 攻击者域名解析到本机时，Host 仍然是那个域名。
+   判据**从不**拿 `Origin` 去比本次请求自己的 `Host`：rebinding 成立时两者恰好一致，那正是漏法。
+2. **Origin / Referer 白名单**：带了就必须是第一方 —— 回环来源（端口任意，桌面壳的渲染服务每次端口都不同）
+   或 `VOCAL_SEPARATOR_ORIGINS` 里登记的来源。跨站的 `multipart/form-data` 表单 POST 不需要预检、
+   也不需要 CORS 允许就能打到业务代码，现在它在排队之前、在写第一个字节之前就被
+   `403 origin_forbidden` 拒掉。不带 Origin/Referer 的是非浏览器调用（curl、MCP 桥、存活探针），放行。
+3. **非 GET 要共享令牌**：配置了令牌时，所有写操作必须带 `x-vocal-token`（或 `Authorization: Bearer`），
+   用 `hmac.compare_digest` 定长时间比较。没带 → `401 token_required`，带错 → `403 token_mismatch`；
+   读操作（`GET`/`HEAD`/`OPTIONS`）永远不需要。状态变更路由永远不会出现 `Access-Control-Allow-Origin: *`。
+
+**令牌发现方式（桌面壳具体做什么）**：解析顺序是 `VOCAL_SEPARATOR_TOKEN`
+→ `<VOCAL_SEPARATOR_DATA_DIR>/security.json`（内容 `{"token": "…"}`）→ 未配置。
+`GET /api/health` 的 `data.guard` 会说出 `token_required`、`token_header`、`token_source`
+和 `token_file` 的绝对路径 —— 只有路径，永远没有令牌本体 —— 所以任何本机第一方进程都知道该去哪读。
+`GET /api/session-token` 只把令牌发给第一方页面（回环来源，响应 `Cache-Control: no-store`），浏览器界面用的就是它；
+`agent/mcp-server.mjs` 读 `data.guard.token_file`；`electron/main.cjs`（经 `electron/api-proxy.cjs`）
+在自己起后端时生成令牌、写进 `security.json`、用 `VOCAL_SEPARATOR_TOKEN` 交给子进程，
+并在 `/api/*` 转发时补上请求头。若它附加到一个"要求令牌却读不到"的后端，就在启动时说清原因失败，
+而不是留下一个点哪都 401 的界面。
+
+没配置令牌时，第 1、2 层照旧生效 —— 这是 `personal-agent-hub/docs/AGENT_API_STANDARD.md`
+里"配置了就要求共享令牌"的原样实现：`python backend/main.py`（agent hub 与 start.bat 起的就是它）
+不改任何调用方就能继续用。
 
 ## Agent API / MCP
 

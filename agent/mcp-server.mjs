@@ -19,10 +19,26 @@ function endpointFile() {
   return existsSync(p) ? readFileSync(p, 'utf8').trim() : null;
 }
 
+// 本机服务闸门（backend/local_guard.py）启用了共享令牌时，非 GET 必须带 x-vocal-token。
+// 标准模板本来不含这一段；这里是本项目加的：令牌路径由 /api/health 的 data.guard.token_file
+// 指出来（只读一个本机文件，不外发），拿不到就不带头 —— 未启用令牌的服务照旧能调。
+let API_TOKEN = '';
+
+function tokenFromHealth(payload) {
+  const guard = (payload && payload.data ? payload.data : {}).guard || {};
+  if (guard.token_required !== true || !guard.token_file) return '';
+  try {
+    const parsed = JSON.parse(readFileSync(guard.token_file, 'utf8'));
+    return typeof parsed?.token === 'string' ? parsed.token.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
 async function rpc(base, method, params) {
   const res = await fetch(`${base}/api/agent/${method === 'tools/list' ? 'tools' : 'tool'}`, {
     method: method === 'tools/list' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(API_TOKEN ? { 'x-vocal-token': API_TOKEN } : {}) },
     body: method === 'tools/list' ? undefined : JSON.stringify(params),
     signal: AbortSignal.timeout(120_000),
   });
@@ -36,7 +52,10 @@ async function ensureBase() {
   for (const base of candidates) {
     try {
       const r = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) });
-      if (r.ok) return base;
+      if (r.ok) {
+        API_TOKEN = tokenFromHealth(await r.json().catch(() => null));
+        return base;
+      }
     } catch { /* 继续尝试 */ }
   }
   // 自动拉起：约定 agent/launch.json = {"command":"node","args":["agent/server.mjs"],"ready_port":8791}
@@ -51,7 +70,10 @@ async function ensureBase() {
     for (let p = port; p < port + 12; p++) {
       try {
         const r = await fetch(`http://127.0.0.1:${p}/api/health`, { signal: AbortSignal.timeout(800) });
-        if (r.ok) return `http://127.0.0.1:${p}`;
+        if (r.ok) {
+          API_TOKEN = tokenFromHealth(await r.json().catch(() => null));
+          return `http://127.0.0.1:${p}`;
+        }
       } catch { /* 未就绪 */ }
     }
   }

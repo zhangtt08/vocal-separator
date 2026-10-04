@@ -5,9 +5,10 @@ const { execFile, spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
+const apiProxy = require("./api-proxy.cjs");
 
-const API_HOST = "127.0.0.1";
-const API_PORT = 8000;
+const API_HOST = apiProxy.API_HOST;
+const API_PORT = apiProxy.API_PORT;
 const HEALTH_PATH = "/api/health";
 
 let mainWindow = null;
@@ -17,6 +18,9 @@ let backendLogFd = null;
 let backendStartError = null;
 let ownsBackend = false;
 let isQuitting = false;
+// 本机后端的共享令牌（闸门要求非 GET 带上它）。空串 = 那台服务没启用令牌。
+let backendToken = "";
+let backendHealth = null;
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -145,7 +149,12 @@ function checkBackend(timeoutMs = 1500) {
         response.on("end", () => {
           try {
             const payload = JSON.parse(body);
-            resolve(response.statusCode === 200 && payload.status === "ok");
+            if (response.statusCode === 200 && payload.status === "ok") {
+              backendHealth = payload;
+              resolve(true);
+              return;
+            }
+            resolve(false);
           } catch {
             resolve(false);
           }
@@ -229,7 +238,15 @@ function findPythonRuntime() {
 }
 
 async function ensureBackend() {
-  if (await checkBackend()) return;
+  const dataDir = path.join(app.getPath("userData"), "data");
+  if (await checkBackend()) {
+    // 附加到别人（start.bat / agent:serve）已经起来的后端：
+    // 按它自己报的 guard.token_file 找回令牌，找不回来就如实失败，不留半能跑的界面。
+    const resolved = apiProxy.tokenForRunningBackend(backendHealth, { dataDir });
+    backendToken = resolved.token;
+    if (resolved.problem) throw new Error(resolved.problem);
+    return;
+  }
 
   const backendEntry = getBackendEntry();
   if (!fs.existsSync(backendEntry)) {
@@ -243,14 +260,17 @@ async function ensureBackend() {
     );
   }
 
-  const dataDir = path.join(app.getPath("userData"), "data");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.dirname(getLogPath()), { recursive: true });
   backendLogFd = fs.openSync(getLogPath(), "a");
   backendStartError = null;
+  // 桌面壳自己起的后端：默认启用共享令牌（env 里已有就用已有的），并把同一份写进
+  // <数据目录>/security.json —— 那是 README 与 /api/health 的 data.guard 里登记的发现方式。
+  const guard = apiProxy.resolveToken({ dataDir, create: true });
+  backendToken = guard.token;
   fs.writeSync(
     backendLogFd,
-    `\n[${new Date().toISOString()}] Starting backend with ${python.command}\n`,
+    `\n[${new Date().toISOString()}] Starting backend with ${python.command} (token source: ${guard.source})\n`,
   );
 
   backendProcess = spawn(
@@ -263,6 +283,7 @@ async function ensureBackend() {
         PYTHONUTF8: "1",
         PYTHONUNBUFFERED: "1",
         VOCAL_SEPARATOR_DATA_DIR: dataDir,
+        VOCAL_SEPARATOR_TOKEN: guard.token,
       },
       windowsHide: true,
       stdio: ["ignore", backendLogFd, backendLogFd],
@@ -287,30 +308,11 @@ async function ensureBackend() {
 }
 
 function proxyApiRequest(request, response) {
-  const headers = { ...request.headers, host: `${API_HOST}:${API_PORT}` };
-  delete headers.connection;
-
-  const upstream = http.request(
-    {
-      host: API_HOST,
-      port: API_PORT,
-      path: request.url,
-      method: request.method,
-      headers,
-    },
-    (upstreamResponse) => {
-      response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
-      upstreamResponse.pipe(response);
-    },
-  );
-
-  upstream.on("error", () => {
-    if (!response.headersSent) {
-      response.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
-    }
-    response.end(JSON.stringify({ detail: "本地 AI 服务暂时不可用" }));
+  return apiProxy.proxyApiRequest(request, response, {
+    host: API_HOST,
+    port: API_PORT,
+    token: backendToken,
   });
-  request.pipe(upstream);
 }
 
 const MIME_TYPES = {

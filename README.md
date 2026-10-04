@@ -56,7 +56,8 @@ Desktop mode: `npm run desktop` (builds `out/`, then Electron serves it and spaw
 | Variable | Effect |
 | --- | --- |
 | `NEXT_PUBLIC_API_BASE_URL` | point the frontend at a different backend address |
-| `VOCAL_SEPARATOR_ORIGINS` | comma-separated frontend origins allowed by the backend (CORS) |
+| `VOCAL_SEPARATOR_ORIGINS` | comma-separated frontend origins allowed by the backend (CORS + guard) |
+| `VOCAL_SEPARATOR_TOKEN` | shared token; when set, every non-GET request must carry `x-vocal-token` |
 | `VOCAL_SEPARATOR_DATA_DIR` | where uploads / outputs / history live (desktop app uses its userData dir) |
 | `VOCAL_SEPARATOR_PORT` | backend port, default `8000` |
 | `VOCAL_SEPARATOR_PYTHON` | which interpreter the desktop shell should launch the backend with |
@@ -65,10 +66,51 @@ Desktop mode: `npm run desktop` (builds `out/`, then Electron serves it and spaw
 ### Checks
 
 ```powershell
+npm run verify      # typecheck + backend unittest + window-control UI test + desktop guard test
 npm run lint
 npm run build
 python -m unittest discover -s backend -v   # or: npm run test:backend
+npm run test:ui                             # window controls hydrate identically
+npm run test:guard                          # desktop shell -> backend first-party path, end to end
 ```
+
+## 🔒 It really is local-only
+
+The service binds `127.0.0.1`, and on top of that every request passes one guard
+(`backend/local_guard.py`, wired in `backend/main.py` as middleware, so routes cannot
+forget it):
+
+1. **Host pinning** — `Host` must be `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`;
+   anything else is a JSON `403 host_forbidden`. This is what kills DNS rebinding: the
+   attacker's domain still shows up in `Host`. The check never compares `Origin` against the
+   request's own `Host` — under rebinding those two agree, which is the bug this rule avoids.
+2. **Origin / Referer allowlist** — if a request carries one, it must be first party: a loopback
+   origin on any port (the desktop shell's renderer server gets a random one) or an origin listed
+   in `VOCAL_SEPARATOR_ORIGINS`. A cross-site `multipart/form-data` form POST — which needs no
+   preflight and no CORS permission to *reach* the handler — is refused with `403 origin_forbidden`
+   before a job is queued and before a byte is written. Absent `Origin`/`Referer` means a
+   non-browser client (curl, the MCP bridge, the health probe), which is allowed.
+3. **Shared token for non-GET** — when a token is configured, all state-changing requests must
+   carry `x-vocal-token` (or `Authorization: Bearer`), compared with `hmac.compare_digest`.
+   Missing → `401 token_required`, wrong → `403 token_mismatch`. Reads (`GET`/`HEAD`/`OPTIONS`)
+   never need it. `Access-Control-Allow-Origin: *` is never sent on state-changing routes.
+
+**Token discovery (what the desktop shell actually does)** — resolution order is
+`VOCAL_SEPARATOR_TOKEN` → `<VOCAL_SEPARATOR_DATA_DIR>/security.json` (`{"token": "…"}`) → not
+configured. `GET /api/health` answers `data.guard` with `token_required`, `token_header`,
+`token_source` and the absolute `token_file` path — never the token itself — so any local
+first-party process knows *where* to look. `GET /api/session-token` hands the token to a
+first-party page (same-origin/loopback only, `Cache-Control: no-store`) and is what the browser
+UI uses; `agent/mcp-server.mjs` reads `data.guard.token_file`; and `electron/main.cjs` (via
+`electron/api-proxy.cjs`) generates a token when it starts the backend itself, writes it to
+`security.json`, passes it to the child in `VOCAL_SEPARATOR_TOKEN` and injects the header into
+its `/api/*` proxy. If it attaches to a backend that requires a token it cannot read, it fails
+at startup with the reason instead of shipping a UI whose buttons 401.
+
+If no token is configured, layers 1 and 2 still apply — that is the
+`personal-agent-hub/docs/AGENT_API_STANDARD.md` "require a shared token on non-GET **when
+configured**" rule, honored literally so that plain `python backend/main.py` (what the agent
+hub and `start.bat` launch) keeps working unchanged.
 
 ## 🤖 Agent API / MCP
 

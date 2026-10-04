@@ -11,6 +11,7 @@
     "lint": "eslint",
     "test:backend": "python -m unittest discover -s backend -v",
     "test:ui": "node scripts/test-window-controls.mjs",
+    "test:guard": "node scripts/test-local-guard.mjs",
     "agent:serve": "python agent/server.py",
     "agent:mcp": "node agent/mcp-server.mjs",
     "desktop": "npm run build && electron .",
@@ -64,6 +65,7 @@
         "filter": [
           "main.py",
           "agent_api.py",
+          "local_guard.py",
           "requirements.txt",
           "ffmpeg.exe"
         ]

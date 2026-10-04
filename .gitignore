@@ -51,6 +51,10 @@ backend/outputs/
 backend/history.json
 backend/ffmpeg.exe
 
+# 本机服务闸门的共享令牌（桌面壳生成，绝不能入库）
+backend/security.json
+security.json
+
 # Agent API 运行时产物（服务地址回执、字节码；都可再生）
 agent/.endpoint
 agent/__pycache__/
@@ -63,3 +67,6 @@ __pycache__/
 
 # Windows 快捷方式（本机启动用，不入库）
 *.lnk
+
+# 闸门共享令牌（本机后端与桌面壳之间；运行时生成，不入库）
+backend/security.json

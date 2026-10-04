@@ -80,6 +80,33 @@ curl -s -X POST http://127.0.0.1:8000/api/agent/tool -H 'content-type: applicati
 未注册工具 → HTTP 400 + `error.code="unknown_tool"` + `error.available=[...]`；
 不存在的 job → `{"ok":false,"error":{"code":"not_found"}}`。
 
+## 闸门：POST /api/agent/tool 也在它后面
+
+`POST /api/agent/tool` 是写操作，所以它和其它非 GET 一样过 `backend/local_guard.py`
+（`personal-agent-hub/docs/AGENT_API_STANDARD.md` 的「本机服务」判据）：
+
+| 条件 | 结果 |
+| --- | --- |
+| `Host` 不是 `127.0.0.1:端口` / `localhost:端口` / `[::1]:端口` | `403` + `error.code="host_forbidden"`（DNS rebinding 挡在这里） |
+| 带 `Origin`/`Referer` 且不是第一方（不是回环来源、也不在 `VOCAL_SEPARATOR_ORIGINS` 里） | `403` + `error.code="origin_forbidden"` |
+| 配了令牌却没带 `x-vocal-token` | `401` + `error.code="token_required"` |
+| 配了令牌但带错 | `403` + `error.code="token_mismatch"` |
+| 回环 Host + 无 Origin（curl / MCP 桥 / 桌面壳探针） | 放行；配了令牌则要求带头 |
+
+**令牌发现方式**：解析顺序 `VOCAL_SEPARATOR_TOKEN` → `<VOCAL_SEPARATOR_DATA_DIR>/security.json`
+的 `token` 字段 → 未配置。`GET /api/health` 的 `data.guard` 说出 `token_required` /
+`token_header` / `token_source` / `token_file`（绝对路径；**不含令牌本体**），
+`GET /api/session-token` 只把令牌发给第一方页面。上面那些 curl 例子中服务是
+`python backend/main.py` 起的、没配令牌，所以不需要带头；配了就要带：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/agent/tool   -H 'content-type: application/json' -H "x-vocal-token: $(python -c "import json;print(json.load(open('backend/security.json'))['token'])")"   -d '{"tool":"vocal.mode_list","input":{}}'
+```
+
+`agent/mcp-server.mjs` 已按同一套发现方式自动带头（它从 `/api/health` 拿 `token_file` 再读文件），
+所以桥不需要额外配置。默认（不设 `VOCAL_SEPARATOR_TOKEN`、也没有 security.json）令牌层不启用，
+Host + Origin 两层始终启用。
+
 ## MCP
 
 任何 MCP 客户端直接起 stdio 桥即可（`tools/list` 转发 `/api/agent/tools`，

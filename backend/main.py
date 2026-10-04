@@ -30,7 +30,9 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+
+import local_guard
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("VOCAL_SEPARATOR_DATA_DIR", BASE_DIR)).resolve()
@@ -1290,6 +1292,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 来源闸门（Host 钉死 + Origin/Referer 白名单 + 非 GET 共享令牌）。
+# 加在 CORS 之后 = 套在它外面，所以任何请求先过闸门再谈跨域读写；
+# 状态变更路由因此永远不可能带出 `Access-Control-Allow-Origin: *`。
+app.add_middleware(
+    local_guard.make_middleware_class(),
+    resolve_state=lambda: local_guard.guard_state_for(DATA_DIR),
+)
+
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
@@ -1319,9 +1329,29 @@ async def health() -> dict[str, Any]:
         "uptime_ms": int((time.time() - _START_TIME) * 1000),
         "active_jobs": active_jobs,
         "presets": preset_descriptors(),
+        "guard": local_guard.guard_state_for(DATA_DIR).describe(),
         **environment,
     }
     return payload
+
+
+@app.get("/api/session-token")
+async def session_token() -> dict[str, Any]:
+    """第一方取令牌的下发口：界面（浏览器 / 桌面壳）先问这里要令牌，再发非 GET 请求。
+
+    能走到这里说明 Host 已经是回环、Origin/Referer 已经是第一方 —— 闸门已经跑过了
+    （中间件在外层）。所以这句话不是"绕开令牌"，而是"令牌本来就只发给第一方页面"：
+    跨站页面既读不到响应（CORS 只放行本机来源），也过不了 Origin 判定。
+    未启用令牌时返回 `required:false`，界面据此不带请求头，行为与启用前一致。
+    """
+    state = local_guard.guard_state_for(DATA_DIR)
+    payload: dict[str, Any] = {
+        "required": state.token_required,
+        "header": local_guard.TOKEN_HEADER,
+        "token": state.token if state.token_required else None,
+        "source": state.token_source,
+    }
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/separate", status_code=status.HTTP_202_ACCEPTED)

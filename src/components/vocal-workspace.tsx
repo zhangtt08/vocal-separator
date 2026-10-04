@@ -296,55 +296,86 @@ function makeKey() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// ── 本机服务闸门（backend/local_guard.py）要求的第一方凭据 ──
+// 非 GET 请求要带 x-vocal-token。令牌从 /api/session-token 取（那个口只发给回环来源），
+// 服务没启用令牌时回 required:false + token:null，这里就一个头都不带 —— 同一套代码
+// 两种配置都能跑，不需要给界面再开一个"是否启用令牌"的开关。
+let tokenPromise: Promise<string> | null = null;
+
+function sessionToken(): Promise<string> {
+  if (!tokenPromise) {
+    tokenPromise = fetch(`${API_BASE}/api/session-token`, { cache: "no-store" })
+      .then((response) => (response.ok ? (response.json() as Promise<{ token?: string | null }>) : { token: null }))
+      .then((body) => (typeof body?.token === "string" ? body.token : ""))
+      .catch(() => "");
+  }
+  return tokenPromise;
+}
+
+async function guardHeaders(): Promise<Record<string, string>> {
+  const token = await sessionToken();
+  return token ? { "x-vocal-token": token } : {};
+}
+
+/** 非 GET 的唯一出口：忘带头就会被闸门 401，界面读到的是闸门写的中文原因。 */
+async function postToBackend(path: string): Promise<Response> {
+  const headers = await guardHeaders();
+  return fetch(`${API_BASE}${path}`, { method: "POST", headers });
+}
+
 /** fetch 拿不到上传进度（大文件要等几十秒没有反馈），所以上传用 XHR。 */
 function uploadForSeparation(
   file: File,
   preset: string,
   onProgress: (percent: number) => void,
 ): Promise<{ job: JobSnapshot; controller: AbortController }> {
-  return new Promise((resolve, reject) => {
-    const controller = new AbortController();
-    const formData = new FormData();
-    formData.append("file", file, file.name);
-    formData.append("preset", preset);
+  return guardHeaders().then(
+    (authHeaders) =>
+      new Promise<{ job: JobSnapshot; controller: AbortController }>((resolve, reject) => {
+        const controller = new AbortController();
+        const formData = new FormData();
+        formData.append("file", file, file.name);
+        formData.append("preset", preset);
 
-    const request = new XMLHttpRequest();
-    request.open("POST", `${API_BASE}/api/separate`);
-    request.responseType = "text";
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
-      }
-    };
-    request.onabort = () => reject(new DOMException("已取消", "AbortError"));
-    request.onerror = () => reject(new Error("无法连接本地 AI 服务"));
-    request.onload = () => {
-      if (controller.signal.aborted) {
-        reject(new DOMException("已取消", "AbortError"));
-        return;
-      }
-      let parsed: JobSnapshot | { detail?: string } = {};
-      try {
-        parsed = JSON.parse(request.responseText || "{}") as JobSnapshot;
-      } catch {
-        reject(new Error(`服务返回了无法解析的内容（${request.status}）`));
-        return;
-      }
-      if (request.status < 200 || request.status >= 300) {
-        reject(new Error((parsed as { detail?: string }).detail || `服务请求失败（${request.status}）`));
-        return;
-      }
-      const job = parsed as JobSnapshot;
-      if (!job.job_id) {
-        reject(new Error("服务未返回有效任务编号。"));
-        return;
-      }
-      onProgress(100);
-      resolve({ job, controller });
-    };
-    controller.signal.addEventListener("abort", () => request.abort());
-    request.send(formData);
-  });
+        const request = new XMLHttpRequest();
+        request.open("POST", `${API_BASE}/api/separate`);
+        for (const [name, value] of Object.entries(authHeaders)) request.setRequestHeader(name, value);
+        request.responseType = "text";
+        request.upload.onprogress = (event) => {
+          if (event.lengthComputable && event.total > 0) {
+            onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
+          }
+        };
+        request.onabort = () => reject(new DOMException("已取消", "AbortError"));
+        request.onerror = () => reject(new Error("无法连接本地 AI 服务"));
+        request.onload = () => {
+          if (controller.signal.aborted) {
+            reject(new DOMException("已取消", "AbortError"));
+            return;
+          }
+          let parsed: JobSnapshot | { detail?: string } = {};
+          try {
+            parsed = JSON.parse(request.responseText || "{}") as JobSnapshot;
+          } catch {
+            reject(new Error(`服务返回了无法解析的内容（${request.status}）`));
+            return;
+          }
+          if (request.status < 200 || request.status >= 300) {
+            reject(new Error((parsed as { detail?: string }).detail || `服务请求失败（${request.status}）`));
+            return;
+          }
+          const job = parsed as JobSnapshot;
+          if (!job.job_id) {
+            reject(new Error("服务未返回有效任务编号。"));
+            return;
+          }
+          onProgress(100);
+          resolve({ job, controller });
+        };
+        controller.signal.addEventListener("abort", () => request.abort());
+        request.send(formData);
+      }),
+  );
 }
 
 export function VocalWorkspace() {
@@ -503,7 +534,7 @@ export function VocalWorkspace() {
         if (abandonRef.current.has(key)) {
           abandonRef.current.delete(key);
           activeJobRef.current = job.job_id;
-          await fetch(`${API_BASE}/api/jobs/${job.job_id}/cancel`, { method: "POST" }).catch(() => null);
+          await postToBackend(`/api/jobs/${job.job_id}/cancel`).catch(() => null);
           patch(key, { state: "cancelled" });
           return;
         }
@@ -641,7 +672,7 @@ export function VocalWorkspace() {
       setSelectedKey((current) => (current === key ? null : current));
       const jobId = item?.job?.job_id;
       if (jobId && item && (item.state === "processing" || item.state === "uploading")) {
-        void fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "POST" }).catch(() => null);
+        void postToBackend(`/api/jobs/${jobId}/cancel`).catch(() => null);
       }
     },
     [],
@@ -661,7 +692,7 @@ export function VocalWorkspace() {
       patch(key, { state: "cancelled" });
       if (!jobId) return;
       try {
-        const response = await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "POST" });
+        const response = await postToBackend(`/api/jobs/${jobId}/cancel`);
         if (!response.ok && response.status !== 409 && response.status !== 404) {
           throw new Error(await getErrorMessage(response));
         }
