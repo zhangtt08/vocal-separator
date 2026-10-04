@@ -62,7 +62,7 @@ Desktop mode: `npm run desktop` (builds `out/`, then Electron serves it and spaw
 | `VOCAL_SEPARATOR_DATA_DIR` | where uploads / outputs / history live (desktop app uses its userData dir) |
 | `VOCAL_SEPARATOR_PORT` | backend port, default `8000` |
 | `VOCAL_SEPARATOR_PYTHON` | which interpreter the desktop shell should launch the backend with |
-| `VOCAL_SEPARATOR_FFMPEG` | explicit ffmpeg path |
+| `VOCAL_SEPARATOR_FFMPEG` | explicit ffmpeg path (ffmpeg is looked up in exactly three places: that variable, `backend/ffmpeg(.exe)`, `PATH` — there is no pip ffmpeg) |
 | `VOCAL_SEPARATOR_JOB_TIMEOUT` | wall-clock seconds one job may hold the GPU (default 1800) |
 | `VOCAL_SEPARATOR_QUEUE_TIMEOUT` | how long a job waits in line before it gives up (default 3600) |
 | `VOCAL_SEPARATOR_CHILD_POLL` | seconds between cancel/deadline checks while the child is silent (default 0.5) |

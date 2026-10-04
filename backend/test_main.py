@@ -9,8 +9,11 @@
 （解释器路径、是否装了 demucs），因为"工具不得返回假数据"是契约里最容易被悄悄破坏的一条。
 """
 
+import ast
 import asyncio
 import importlib.util
+import inspect
+import os
 import sys
 import tempfile
 import threading
@@ -545,6 +548,85 @@ class BackendTests(ServiceSandbox, unittest.TestCase):
 
         old_python = main.environment_issues({**base, "python_version": "3.8.10"})
         self.assertEqual(old_python[0]["key"], "python")
+
+    def test_ffmpeg_lookup_offers_exactly_the_sources_that_exist(self):
+        """查找路径与文档/依赖清单必须说实话：没有依赖就没有那一路。
+
+        以前 find_ffmpeg() 还有一条 `import imageio_ffmpeg` 兜底，而
+        backend/requirements.txt 从来没有 imageio-ffmpeg（那份清单明写
+        "ffmpeg 不是 pip 依赖"）—— 第四路永远 ImportError，等于在代码里
+        留了一条走不到的分支，自检与报错文案跟着说谎。
+        """
+        # 按 AST 判：注释与文档字符串里讲历史可以，真正的 import / 调用一处都不许留。
+        tree = ast.parse(inspect.getsource(main))
+        imported: set[str] = set()
+        attribute_hosts: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(str(node.module))
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                attribute_hosts.add(node.value.id)
+        declared = [
+            line.split("=")[0].split("#")[0].strip()
+            for line in (main.BASE_DIR / "requirements.txt").read_text(encoding="utf-8").lower().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertNotIn("imageio_ffmpeg", imported, "依赖清单里没有它，代码里就不许 import 它")
+        self.assertNotIn("imageio_ffmpeg", attribute_hosts)
+        self.assertNotIn("imageio-ffmpeg", declared, "依赖清单里既然没有它，查找里就不许有这一路")
+        self.assertIn("demucs", declared)  # 上面那两条是"两边都得说真话"，不是把清单清空
+        labels = []
+        for entry in main.ffmpeg_candidates():
+            if entry["source"] not in labels:
+                labels.append(entry["source"])
+        self.assertEqual(labels, ["env:VOCAL_SEPARATOR_FFMPEG", "bundled", "PATH"])
+        self.assertEqual(main.ffmpeg_search_description(), "env:VOCAL_SEPARATOR_FFMPEG → bundled → PATH")
+
+    def test_ffmpeg_lookup_actually_uses_each_source_in_order(self):
+        with tempfile.TemporaryDirectory() as raw:
+            explicit = Path(raw) / "custom-ffmpeg.exe"
+            explicit.write_bytes(b"stub ffmpeg")
+            with patch.dict(os.environ, {"VOCAL_SEPARATOR_FFMPEG": str(explicit)}):
+                self.assertEqual(main.find_ffmpeg(), str(explicit))
+                first = main.ffmpeg_candidates()[0]
+                self.assertEqual(first["exists"], True)
+            missing = Path(raw) / "nope.exe"
+            with patch.dict(os.environ, {"VOCAL_SEPARATOR_FFMPEG": str(missing)}), patch.object(
+                main, "BASE_DIR", Path(raw)
+            ), patch.object(main.shutil, "which", return_value=None):
+                self.assertEqual(main.find_ffmpeg(), "")
+                probed = main.ffmpeg_candidates()
+                self.assertEqual([entry["exists"] for entry in probed], [False, False, False, False])
+                self.assertEqual(probed[0]["path"], str(missing), "找不到时也要说清它试过哪个路径")
+
+    def test_environment_and_issue_text_describe_the_same_lookup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            with patch.dict(os.environ, {"VOCAL_SEPARATOR_FFMPEG": ""}), patch.object(main, "BASE_DIR", Path(raw)), patch.object(
+                main.shutil, "which", return_value=None
+            ):
+                environment = main._compute_environment()
+            self.assertFalse(environment["ffmpeg_available"])
+            self.assertEqual(len(environment["ffmpeg_candidates"]), 4)
+            issues = {item["key"]: item for item in main.environment_issues(environment)}
+            detail = issues["ffmpeg"]["detail"]
+            # 报错文案里出现的来源，必须就是代码真的找过的那几处 —— 一处不多一处不少。
+            for entry in environment["ffmpeg_candidates"]:
+                self.assertIn(str(entry["source"]), detail)
+            self.assertNotIn("imageio", detail)
+            self.assertIn("pip", detail)
+
+    def test_video_error_without_ffmpeg_names_the_three_places(self):
+        with tempfile.TemporaryDirectory() as raw:
+            with patch.object(main, "find_ffmpeg", return_value=""):
+                with self.assertRaises(RuntimeError) as caught:
+                    main.convert_video_to_audio("aaaa1111aaaa", Path(raw) / "clip.mp4")
+        message = str(caught.exception)
+        self.assertIn("VOCAL_SEPARATOR_FFMPEG", message)
+        self.assertIn("PATH", message)
+        self.assertIn("三处", message)
+        self.assertNotIn("imageio", message)
 
     def test_failure_remedy_keeps_raw_output_and_next_step(self):
         raw = "ModuleNotFoundError: No module named 'demucs'"

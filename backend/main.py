@@ -146,25 +146,50 @@ class SeparationCancelled(Exception):
     """用户主动取消音轨分离。"""
 
 
-def find_ffmpeg() -> str:
-    """按环境变量、程序目录、PATH 和 imageio-ffmpeg 的顺序查找 ffmpeg。"""
-    candidates = [
-        os.getenv("VOCAL_SEPARATOR_FFMPEG", "").strip('"'),
-        str(BASE_DIR / "ffmpeg.exe"),
-        str(BASE_DIR / "ffmpeg"),
-    ]
-    path_found = shutil.which("ffmpeg")
-    if path_found:
-        candidates.append(path_found)
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return candidate
-    try:
-        import imageio_ffmpeg
+def ffmpeg_candidates() -> list[dict[str, Any]]:
+    """ffmpeg 到底从哪几处找 —— 查找、自检与报错文案读的都是这一份。
 
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        return ""
+    这里曾经还有第四路 `import imageio_ffmpeg`，但 backend/requirements.txt 里
+    从来没有 imageio-ffmpeg（那份清单还专门写着"ffmpeg 不是 pip 依赖"），
+    所以第四路永远 ImportError —— 一条走不到的分支写在那里，只会让自检说谎。
+    现在只有三处：环境变量、随软件带的 ffmpeg、PATH。
+    """
+    found_in_path = shutil.which("ffmpeg")
+    entries = [
+        ("env:VOCAL_SEPARATOR_FFMPEG", os.getenv("VOCAL_SEPARATOR_FFMPEG", "").strip('"')),
+        ("bundled", str(BASE_DIR / "ffmpeg.exe")),
+        ("bundled", str(BASE_DIR / "ffmpeg")),
+        ("PATH", found_in_path or ""),
+    ]
+    result: list[dict[str, Any]] = []
+    for source, candidate in entries:
+        if not candidate:
+            result.append({"source": source, "path": None, "exists": False, "note": "未设置" if source.startswith("env:") else "没有这个文件"})
+            continue
+        try:
+            exists = Path(candidate).is_file()
+        except OSError:
+            exists = False
+        result.append({"source": source, "path": candidate, "exists": exists, "note": None if exists else "路径不存在"})
+    return result
+
+
+def find_ffmpeg() -> str:
+    """按 ffmpeg_candidates() 的顺序返回第一个真实存在的 ffmpeg；找不到返回空串。"""
+    for entry in ffmpeg_candidates():
+        if entry["exists"]:
+            return str(entry["path"])
+    return ""
+
+
+def ffmpeg_search_description() -> str:
+    """给人看的一句话，与 ffmpeg_candidates() 同源 —— 不会再和代码说两套。"""
+    ordered: list[str] = []
+    for entry in ffmpeg_candidates():
+        label = str(entry["source"])
+        if label not in ordered:
+            ordered.append(label)
+    return " → ".join(ordered)
 
 
 def _run_quiet(command: list[str], timeout: int = 15) -> str:
@@ -307,6 +332,9 @@ def _compute_environment() -> dict[str, Any]:
     environment["ffmpeg_path"] = ffmpeg or None
     environment["ffmpeg_available"] = bool(ffmpeg)
     environment["ffmpeg_version"] = _run_quiet([ffmpeg, "-version"]) if ffmpeg else None
+    # 查找过程的原始记录：自检里"找过哪几处"必须是实测，不是照抄一句说明。
+    environment["ffmpeg_candidates"] = ffmpeg_candidates()
+    environment["ffmpeg_sources"] = ffmpeg_search_description()
 
     environment["model"] = MODEL_NAME
     environment["model_cache"] = _model_cache_info(MODEL_NAME)
@@ -410,14 +438,18 @@ def environment_issues(environment: dict[str, Any]) -> list[dict[str, Any]]:
             )
 
     if not environment.get("ffmpeg_available"):
-        bundled_ffmpeg = str(BASE_DIR / "ffmpeg.exe")
+        probed = environment.get("ffmpeg_candidates") or ffmpeg_candidates()
+        checked = "；".join(
+            f'{entry["source"]}={entry["path"] or "未设置"}' for entry in probed
+        )
         issues.append(
             {
                 "key": "ffmpeg",
                 "label": "没找到 ffmpeg，视频文件读不了（音频不受影响）",
                 "severity": "warning",
-                "detail": f"后端按顺序找：环境变量 VOCAL_SEPARATOR_FFMPEG、{bundled_ffmpeg}、PATH。",
-                "command": f'winget install --id Gyan.FFmpeg -E   或把 ffmpeg.exe 放进 "{BASE_DIR}"',
+                # 逐条把"找过哪里、那处有什么"摊开；文案与查找同源，不会再出现第四路。
+                "detail": f"后端找过这几处（全部落空）：{checked}。依赖清单里没有、也不该有 pip 版 ffmpeg。",
+                "command": f'winget install --id Gyan.FFmpeg -E   或把 ffmpeg.exe 放进 "{BASE_DIR}"，或设 VOCAL_SEPARATOR_FFMPEG',
             }
         )
 
@@ -1328,8 +1360,9 @@ def convert_video_to_audio(job_id: str, input_path: Path, deadline_at: float | N
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError(
-            "未找到 ffmpeg，无法读取视频文件。请安装 ffmpeg，或把 ffmpeg.exe 放到后端目录（"
-            f"{BASE_DIR}），或设置环境变量 VOCAL_SEPARATOR_FFMPEG 指向它。"
+            "未找到 ffmpeg，无法读取视频文件。查找顺序只有三处（没有 pip 版兜底）："
+            f"环境变量 VOCAL_SEPARATOR_FFMPEG、后端目录 {BASE_DIR} 里的 ffmpeg(.exe)、PATH。"
+            "任选一处装上即可：winget install --id Gyan.FFmpeg -E"
         )
 
     _update_job(job_id, phase="extracting_audio", progress=4)

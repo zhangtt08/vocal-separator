@@ -53,7 +53,7 @@ npm run dev              # 前端 http://localhost:3000
 | `VOCAL_SEPARATOR_DATA_DIR` | 上传 / 输出 / history 存放目录（桌面版用自己的 userData） |
 | `VOCAL_SEPARATOR_PORT` | 后端端口，默认 `8000` |
 | `VOCAL_SEPARATOR_PYTHON` | 桌面壳用哪个 Python 起后端 |
-| `VOCAL_SEPARATOR_FFMPEG` | 指定 ffmpeg 路径 |
+| `VOCAL_SEPARATOR_FFMPEG` | 指定 ffmpeg 路径（ffmpeg 只在这三处找：这个变量、`backend/ffmpeg(.exe)`、PATH；没有 pip 版兜底） |
 | `VOCAL_SEPARATOR_JOB_TIMEOUT` | 单个任务最多占显卡多少秒（默认 1800） |
 | `VOCAL_SEPARATOR_QUEUE_TIMEOUT` | 排队最久等多久就放弃（默认 3600） |
 | `VOCAL_SEPARATOR_CHILD_POLL` | 子进程不出声时，隔多少秒查一次取消与墙钟（默认 0.5） |
