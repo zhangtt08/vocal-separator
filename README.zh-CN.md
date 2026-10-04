@@ -10,7 +10,7 @@
 
 - **两种音轨预设**：`四条音轨`（人声 / 鼓组 / 贝斯 / 其他）或 `人声 + 伴奏`（Demucs `--two-stems`），每轨一个 WAV
 - **批量队列**：一次拖多首，按顺序一首一首跑（一个 Demucs 任务独占显卡），每行显示上传百分比、阶段、已用时间与预计剩余
-- **可取消**：排队中或正在跑的任务都能取消，会真的终止 Demucs 子进程并清掉该任务的目录
+- **卡住也取消得掉**：排队中与进行中的任务都能取消。读子进程输出放在守护线程里，主循环每 0.5 秒醒一次看取消标记与墙钟（`VOCAL_SEPARATOR_CHILD_POLL`），到点走 terminate → 等一下 → kill，并把显卡槽位还回去（`VOCAL_SEPARATOR_JOB_TIMEOUT`，默认 30 分钟）；只赖着不退出也会被同一套序列收掉
 - **本机环境看得见**：界面顶部那条是实测值——python / torch / CUDA 设备名 / Demucs / ffmpeg 版本与路径，以及 `htdemucs` 权重是否已缓存
 - **失败给出路**：没装 Demucs、缺 ffmpeg、显存不够、结果过期，都各自给出下一步该做什么，而不是一串报错
 - **最近结果**：持久索引 `backend/history.json` 记录历次分离的真实文件与字节数；重复拖入同一个文件会先问"这首已经分离过，还要再来一遍吗"
@@ -54,6 +54,9 @@ npm run dev              # 前端 http://localhost:3000
 | `VOCAL_SEPARATOR_PORT` | 后端端口，默认 `8000` |
 | `VOCAL_SEPARATOR_PYTHON` | 桌面壳用哪个 Python 起后端 |
 | `VOCAL_SEPARATOR_FFMPEG` | 指定 ffmpeg 路径 |
+| `VOCAL_SEPARATOR_JOB_TIMEOUT` | 单个任务最多占显卡多少秒（默认 1800） |
+| `VOCAL_SEPARATOR_QUEUE_TIMEOUT` | 排队最久等多久就放弃（默认 3600） |
+| `VOCAL_SEPARATOR_CHILD_POLL` | 子进程不出声时，隔多少秒查一次取消与墙钟（默认 0.5） |
 
 ## 检查
 

@@ -21,7 +21,7 @@ Separating vocals usually means uploading your audio to an online service and wa
 
 - **Two track presets** — `四条音轨` (vocals / drums / bass / other) or `人声 + 伴奏` (vocal + instrumental, via Demucs `--two-stems`); every stem is a WAV file
 - **Batch queue** — drop several files at once, they run one at a time (a Demucs job owns the GPU), each row shows upload percent, phase, elapsed time and an ETA
-- **Cancellable** — cancel a queued or running job; the Demucs subprocess is terminated and its job directory removed
+- **Cancellable, even when Demucs goes silent** — cancel a queued *or* running job; output is read on a watchdog thread and the loop wakes every 0.5 s (`VOCAL_SEPARATOR_CHILD_POLL`) to check the cancel flag and a wall-clock deadline (`VOCAL_SEPARATOR_JOB_TIMEOUT`, default 30 min), then escalates terminate → wait → kill and returns the GPU slot. A child that never exits is reaped by the same sequence, and both paths report honestly (`服务重启，未跑完` / 墙钟到点) rather than pretending the job finished
 - **Machine health you can read** — the UI strip shows the real python / torch / CUDA device / Demucs / ffmpeg versions and whether the `htdemucs` weights are already cached
 - **Actionable failures** — missing Demucs, missing ffmpeg, CUDA out of memory and expired results each come with the next step to take, not just an error string
 - **Recent results** — a persistent index (`backend/history.json`) lists past separations with real file sizes, so re-dropping the same file asks "already separated, run again?" instead of silently burning 10 minutes
@@ -63,6 +63,9 @@ Desktop mode: `npm run desktop` (builds `out/`, then Electron serves it and spaw
 | `VOCAL_SEPARATOR_PORT` | backend port, default `8000` |
 | `VOCAL_SEPARATOR_PYTHON` | which interpreter the desktop shell should launch the backend with |
 | `VOCAL_SEPARATOR_FFMPEG` | explicit ffmpeg path |
+| `VOCAL_SEPARATOR_JOB_TIMEOUT` | wall-clock seconds one job may hold the GPU (default 1800) |
+| `VOCAL_SEPARATOR_QUEUE_TIMEOUT` | how long a job waits in line before it gives up (default 3600) |
+| `VOCAL_SEPARATOR_CHILD_POLL` | seconds between cancel/deadline checks while the child is silent (default 0.5) |
 
 ### Checks
 

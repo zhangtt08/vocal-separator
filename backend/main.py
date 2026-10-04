@@ -16,6 +16,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -99,6 +100,15 @@ PHASE_LABELS = {
 SEPARATION_SLOTS = threading.Semaphore(1)
 # 排队时每隔 1 秒回看一次取消标记，否则"取消排在后面的那首"要等前一首跑完才生效。
 SLOT_POLL_SECONDS = 1.0
+# 排队最长等多久（放弃了要说得清原因，而不是干等）。
+QUEUE_WAIT_TIMEOUT_SECONDS = int(os.getenv("VOCAL_SEPARATOR_QUEUE_TIMEOUT", "3600"))
+# 一个任务从"拿到显卡"开始的墙钟上限。判据是墙钟而不是输出行数：
+# Demucs 卡在驱动/磁盘上时可以一个字都不吐，那时候唯一还说得过去的动作就是按时间收手。
+JOB_WALL_CLOCK_SECONDS = int(os.getenv("VOCAL_SEPARATOR_JOB_TIMEOUT", "1800"))
+# 子进程没说话时也要醒来看一眼取消与墙钟（秒）。以前是 for line in stdout：
+# 它一阻塞，取消就只能等到 3600 秒的 TTL 清扫。
+CHILD_POLL_SECONDS = float(os.getenv("VOCAL_SEPARATOR_CHILD_POLL", "0.5"))
+
 # 失败时留给用户看的原始输出行数（Demucs/ffmpeg 的真实 stderr，不改写、不美化）。
 ERROR_OUTPUT_TAIL = 12
 
@@ -1175,13 +1185,106 @@ def _remove_quiet(target: Path) -> None:
         pass
 
 
+class SeparationTimeout(Exception):
+    """墙钟到点：子进程还占着显卡但没有可确认的进展，按时间收手。"""
+
+
+_STREAM_END = object()
+
+
+def iter_child_output(
+    job_id: str,
+    process: Any,
+    *,
+    stage_label: str = "分离",
+    deadline_at: float | None = None,
+) -> Any:
+    """按行读子进程输出，但**不等它说话**。
+
+    以前是 `for line in process.stdout:` —— Demucs 卡住不吐字时这一行就永远阻塞，
+    于是"取消"和"超时"都要等到 3600 秒 TTL 清扫才可能生效（验收的 MAJOR 之一）。
+    现在读行放到守护线程里，主循环每 CHILD_POLL_SECONDS 醒一次，先看取消标记、
+    再看墙钟；任一成立就走 terminate -> wait -> kill（`_terminate_process`）。
+    """
+    lines: queue.Queue = queue.Queue(maxsize=256)
+
+    def pump() -> None:
+        stream = getattr(process, "stdout", None)
+        if stream is None:
+            lines.put(_STREAM_END)
+            return
+        try:
+            for line in stream:
+                lines.put(line)
+        except (OSError, ValueError):  # 进程被终止后读管道会抛，正常收尾
+            pass
+        finally:
+            lines.put(_STREAM_END)
+
+    threading.Thread(target=pump, name=f"vocal-output-reader-{job_id}", daemon=True).start()
+
+    exhausted = False
+    while not exhausted:
+        if _job_cancel_requested(job_id):
+            _terminate_process(process)
+            raise SeparationCancelled
+        if deadline_at is not None and time.time() >= deadline_at:
+            _terminate_process(process)
+            raise SeparationTimeout(
+                f"{stage_label}超过 {human_minutes(JOB_WALL_CLOCK_SECONDS)} 没跑完，已终止子进程并放开发显卡的槽位。"
+            )
+        try:
+            item = lines.get(timeout=CHILD_POLL_SECONDS)
+        except queue.Empty:
+            continue
+        if item is _STREAM_END:
+            exhausted = True
+            continue
+        yield item
+
+
+def child_deadline() -> float:
+    """本回合的墙钟红线：从现在起再给 JOB_WALL_CLOCK_SECONDS。"""
+    return time.time() + JOB_WALL_CLOCK_SECONDS
+
+
+def human_minutes(seconds: int) -> str:
+    """把秒数说成人能照着判断的单位（不到一分钟就说秒，别写"0 分钟"）。"""
+    value = max(1, int(seconds))
+    if value < 60:
+        return f"{value} 秒"
+    minutes = value / 60
+    text = f"{int(minutes)}" if float(minutes).is_integer() else f"{round(minutes, 1)}"
+    return f"{text} 分钟"
+
+
+def wait_for_child(process: Any, timeout: float, *, stage_label: str = "分离") -> int:
+    """等子进程退出，但有上限。
+
+    管道关了就等于"它说完了"，不等于"它退了"：一个卡在退出路径上的 Demucs
+    （显存没释放、文件句柄没关）会让无界的 process.wait() 永远不返回，
+    于是槽位一直被占。到点同样走 terminate -> wait -> kill。
+    """
+    try:
+        try:
+            return int(process.wait(timeout=timeout))
+        except TypeError:
+            # 测试里的假进程只有 wait() 一个形参（和 _terminate_process 同一套按能力调用）。
+            return int(process.wait())
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process(process)
+        raise SeparationTimeout(
+            f"{stage_label}的子进程在到点后没有退出，已强制终止并释放显卡槽位。"
+        ) from exc
+
+
 def acquire_separation_slot(job_id: str) -> str:
     """拿分离槽位，返回 acquired / cancelled / timeout。
 
     排队中的任务以前只在开工前检查一次取消标记，于是"取消一首排队的歌"会静默失效——
     槽位一空出来照样把整首跑完，白占显卡。这里改成每秒回看一次取消。
     """
-    deadline = time.time() + FILE_TTL_SECONDS
+    deadline = time.time() + QUEUE_WAIT_TIMEOUT_SECONDS
     while True:
         if _job_cancel_requested(job_id):
             return "cancelled"
@@ -1220,7 +1323,7 @@ def demucs_progress(line: str) -> int | None:
     return max(10, min(10 + int(int(match.group(1)) * 0.85), 95))
 
 
-def convert_video_to_audio(job_id: str, input_path: Path) -> Path:
+def convert_video_to_audio(job_id: str, input_path: Path, deadline_at: float | None = None) -> Path:
     """把视频文件解码为 16 位 PCM WAV，输出与输入同名以便沿用 Demucs 目录结构。"""
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -1259,22 +1362,25 @@ def convert_video_to_audio(job_id: str, input_path: Path) -> Path:
         )
         _update_job(job_id, process=process)
 
-        if process.stdout is not None:
-            for line in process.stdout:
-                if _job_cancel_requested(job_id):
-                    _terminate_process(process)
-                    raise SeparationCancelled
-                clean_line = line.strip()
-                if clean_line:
-                    output_lines.append(clean_line)
+        # 墙钟与取消都在 iter_child_output 里判：ffmpeg 卡住不吐字时这条也不能干等。
+        for line in iter_child_output(job_id, process, stage_label="从视频提取音频", deadline_at=deadline_at):
+            clean_line = line.strip()
+            if clean_line:
+                output_lines.append(clean_line)
 
-        return_code = process.wait()
+        return_code = wait_for_child(
+            process, max(30.0, (deadline_at - time.time()) if deadline_at else 60.0), stage_label="从视频提取音频"
+        )
         _close_pipe(process)
         if _job_cancel_requested(job_id):
             raise SeparationCancelled
         if return_code != 0:
             raise RuntimeError(output_tail(output_lines) or f"ffmpeg 退出码：{return_code}")
     except SeparationCancelled:
+        _terminate_process(process)
+        _remove_quiet(audio_path)
+        raise
+    except SeparationTimeout:
         _terminate_process(process)
         _remove_quiet(audio_path)
         raise
@@ -1343,7 +1449,10 @@ def run_separation(job_id: str, input_path: Path) -> None:
                 status="error",
                 progress=0,
                 phase="failed",
-                error=f"排队等待超过 {FILE_TTL_SECONDS // 60} 分钟，任务已放弃。前面如果有任务卡住，可以取消它。",
+                error=(
+                    f"排队等待超过 {human_minutes(QUEUE_WAIT_TIMEOUT_SECONDS)}，任务已放弃。"
+                    "前面那一首如果卡住会自己按墙钟收手；也可以直接取消它腾出槽位。"
+                ),
                 finished_at=time.time(),
             )
         return
@@ -1355,8 +1464,10 @@ def run_separation(job_id: str, input_path: Path) -> None:
     output_lines: deque[str] = deque(maxlen=ERROR_OUTPUT_TAIL)
     process = None
     try:
+        # 墙钟从拿到槽位、真正开工这一刻算起，排队时间不计入。
+        deadline_at = child_deadline()
         if input_path.suffix.lower() in VIDEO_EXTENSIONS:
-            audio_path = convert_video_to_audio(job_id, input_path)
+            audio_path = convert_video_to_audio(job_id, input_path, deadline_at=deadline_at)
             _update_job(job_id, progress=6, phase="loading_model")
 
         command = [
@@ -1384,30 +1495,28 @@ def run_separation(job_id: str, input_path: Path) -> None:
         )
         _update_job(job_id, process=process)
 
-        if process.stdout is not None:
-            for line in process.stdout:
-                if _job_cancel_requested(job_id):
-                    _terminate_process(process)
-                    raise SeparationCancelled
-                clean_line = line.strip()
-                if clean_line:
-                    output_lines.append(clean_line)
-                changes: dict[str, Any] = {}
-                phase = _demucs_phase(clean_line)
-                if phase:
-                    changes["phase"] = phase
-                step = demucs_progress(clean_line)
-                if step is None and phase == "separating":
-                    # Demucs 刚说"Separating track"时进度条还没开画，
-                    # 下限给它映射的起点 10%，别让阶段写着"分离音轨"而进度停在 2%。
-                    step = 10
-                if step is not None:
-                    # 只往前走，不回退（Demucs 每条轨各起一个进度条）。
-                    changes["progress"] = max(job_progress(job_id), step)
-                if changes:
-                    _update_job(job_id, **changes)
+        for line in iter_child_output(job_id, process, stage_label="分离音轨", deadline_at=deadline_at):
+            clean_line = line.strip()
+            if clean_line:
+                output_lines.append(clean_line)
+            changes: dict[str, Any] = {}
+            phase = _demucs_phase(clean_line)
+            if phase:
+                changes["phase"] = phase
+            step = demucs_progress(clean_line)
+            if step is None and phase == "separating":
+                # Demucs 刚说"Separating track"时进度条还没开画，
+                # 下限给它映射的起点 10%，别让阶段写着"分离音轨"而进度停在 2%。
+                step = 10
+            if step is not None:
+                # 只往前走，不回退（Demucs 每条轨各起一个进度条）。
+                changes["progress"] = max(job_progress(job_id), step)
+            if changes:
+                _update_job(job_id, **changes)
 
-        return_code = process.wait()
+        return_code = wait_for_child(
+            process, max(30.0, deadline_at - time.time()), stage_label="分离音轨"
+        )
         _close_pipe(process)
         if _job_cancel_requested(job_id):
             raise SeparationCancelled
@@ -1465,6 +1574,22 @@ def run_separation(job_id: str, input_path: Path) -> None:
         # 先把状态落定再收尾：清理半成品可能因为文件还被占着而失败，
         # 但那不该让用户一直看到"处理中"，更不该把显卡槽位一起带走。
         _update_job(job_id, status="cancelled", progress=0, phase="cancelled", error=None, finished_at=time.time())
+        _terminate_process(process)
+        _remove_quiet(work_dir)
+    except SeparationTimeout as exc:
+        # 墙钟到点（或子进程赖着不退）：状态先落定，再收进程与半成品，最后还槽位。
+        _update_job(
+            job_id,
+            status="error",
+            progress=0,
+            phase="failed",
+            error=(
+                f"{exc} 这一步是墙钟判定，不看输出行数 —— 子进程一个字都不吐时也只有它还能收手。"
+                "这一首没有记成完成，输出目录已清掉。下一步：确认没有别的程序占着显卡；"
+                f"CPU 分离本来就慢，可用 VOCAL_SEPARATOR_JOB_TIMEOUT 调大上限（当前 {human_minutes(JOB_WALL_CLOCK_SECONDS)}）。"
+            ),
+            finished_at=time.time(),
+        )
         _terminate_process(process)
         _remove_quiet(work_dir)
     except Exception as exc:
@@ -1525,7 +1650,9 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         "stems": {},
         "was_running": was_running,
         "note": (
-            "已终止在跑的 Demucs 子进程，该任务的输出目录会被清掉。"
+            "已终止在跑的 Demucs 子进程（terminate -> 等一下 -> 还没死就 kill），"
+            "输出目录会被清掉。子进程一句输出都没有也照样生效：读输出放在守护线程里，"
+            f"主循环每 {CHILD_POLL_SECONDS} 秒醒一次看取消标记。"
             if was_running
             else "这一首还在排队、没占用显卡：线程每秒查一次取消标记，最多 1 秒后就会放弃。"
         ),
