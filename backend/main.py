@@ -11,6 +11,7 @@ GET /api/agent/manifest、POST /api/agent/tool）。契约端点由 `backend/age
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import importlib.util
 import json
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -88,6 +90,10 @@ PHASE_LABELS = {
 
 # Demucs 一次跑满一张显卡才划算，所以分离槽位=1：后来的任务留在 queued 并给出排队位次。
 SEPARATION_SLOTS = threading.Semaphore(1)
+# 排队时每隔 1 秒回看一次取消标记，否则"取消排在后面的那首"要等前一首跑完才生效。
+SLOT_POLL_SECONDS = 1.0
+# 失败时留给用户看的原始输出行数（Demucs/ffmpeg 的真实 stderr，不改写、不美化）。
+ERROR_OUTPUT_TAIL = 12
 
 HISTORY_FILE_NAME = "history.json"
 HISTORY_LIMIT = 60
@@ -158,6 +164,9 @@ def _run_quiet(command: list[str], timeout: int = 15) -> str:
 
 ENV_PROBE: dict[str, Any] = {"status": "probing"}
 env_probe_lock = threading.Lock()
+_probe_state: dict[str, Any] = {"started_at": None, "inflight": False}
+# 超过这个时间还停在 probing/failed 就自动补一次探测，不让界面卡在"正在检测"。
+PROBE_STALE_SECONDS = 30.0
 _demucs_model_sigs_cache: dict[str, list[str]] = {}
 
 
@@ -280,34 +289,209 @@ def _compute_environment() -> dict[str, Any]:
     environment["data_dir"] = str(DATA_DIR)
     environment["uploads_dir"] = str(UPLOADS_DIR)
     environment["outputs_dir"] = str(OUTPUTS_DIR)
+    environment["requirements_file"] = str(BASE_DIR / "requirements.txt")
+    environment["outputs_writable"] = _is_writable(OUTPUTS_DIR)
+    try:
+        environment["disk_free_mb"] = round(shutil.disk_usage(str(OUTPUTS_DIR)).free / 1_048_576, 1)
+    except OSError:
+        environment["disk_free_mb"] = None
     environment["file_ttl_seconds"] = FILE_TTL_SECONDS
     environment["max_file_size_bytes"] = MAX_FILE_SIZE
+    environment["issues"] = environment_issues(environment)
+    environment["can_separate"] = not any(item["severity"] == "blocking" for item in environment["issues"])
     return environment
 
 
+def _is_writable(directory: Path) -> bool:
+    """真的试写一个文件——只看权限位在这个场景里不够。"""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".write-probe-{os.getpid()}"
+        probe.write_bytes(b"")
+        probe.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def environment_issues(environment: dict[str, Any]) -> list[dict[str, Any]]:
+    """把探测到的事实翻译成能执行的下一步。
+
+    五种最卡人的情况（没 python / 没 demucs / 没 ffmpeg / CUDA 用不上 / 权重没缓存）
+    都必须带一条真命令和一个真实路径，`blocking` 表示现在这份活干不了。
+    """
+    issues: list[dict[str, Any]] = []
+    interpreter = environment.get("python_executable") or sys.executable
+    requirements = environment.get("requirements_file") or str(BASE_DIR / "requirements.txt")
+    install = f'"{interpreter}" -m pip install -r "{requirements}"'
+
+    version_parts = str(environment.get("python_version") or "").split(".")
+    try:
+        python_minor = int(version_parts[1])
+    except (IndexError, ValueError):
+        python_minor = None
+    if python_minor is not None and python_minor < 10:
+        issues.append(
+            {
+                "key": "python",
+                "label": f"Python {environment.get('python_version')} 太旧，Demucs 4 需要 3.10 以上",
+                "severity": "blocking",
+                "detail": f"当前解释器：{interpreter}",
+                "command": "安装 Python 3.10–3.12，再对它重装依赖：" + install,
+            }
+        )
+
+    if not environment.get("demucs_installed"):
+        issues.append(
+            {
+                "key": "demucs",
+                "label": "这个 Python 里没有 Demucs，界面只能检测不能分离",
+                "severity": "blocking",
+                "detail": f"解释器：{interpreter}；依赖清单：{requirements}",
+                "command": install,
+            }
+        )
+    elif not environment.get("torch_installed"):
+        issues.append(
+            {
+                "key": "torch",
+                "label": "装了 Demucs 但缺 PyTorch，模型跑不起来",
+                "severity": "blocking",
+                "detail": f"解释器：{interpreter}",
+                "command": install,
+            }
+        )
+
+    if not environment.get("cuda_available"):
+        if environment.get("nvidia_smi_present"):
+            issues.append(
+                {
+                    "key": "cuda",
+                    "label": "本机有显卡但 torch 用不上 CUDA，会用 CPU 分离（慢 10–30 倍）",
+                    "severity": "warning",
+                    "detail": environment.get("cuda_note") or environment.get("cuda_error")
+                    or "torch.cuda.is_available() 为 False，而 nvidia-smi 能列出显卡：多半装成了 CPU 版 torch 或驱动不匹配。",
+                    "command": install + "  （清单里锁的是 cu124 轮子；装完重启后端，并更新显卡驱动）",
+                }
+            )
+        else:
+            issues.append(
+                {
+                    "key": "cuda",
+                    "label": "没有可用显卡，按 CPU 分离",
+                    "severity": "warning",
+                    "detail": "一首 4 分钟的歌在 CPU 上要几分钟到十几分钟；队列仍按一次一首处理。",
+                    "command": None,
+                }
+            )
+
+    if not environment.get("ffmpeg_available"):
+        bundled_ffmpeg = str(BASE_DIR / "ffmpeg.exe")
+        issues.append(
+            {
+                "key": "ffmpeg",
+                "label": "没找到 ffmpeg，视频文件读不了（音频不受影响）",
+                "severity": "warning",
+                "detail": f"后端按顺序找：环境变量 VOCAL_SEPARATOR_FFMPEG、{bundled_ffmpeg}、PATH。",
+                "command": f'winget install --id Gyan.FFmpeg -E   或把 ffmpeg.exe 放进 "{BASE_DIR}"',
+            }
+        )
+
+    model_cache = environment.get("model_cache") or {}
+    if not model_cache.get("cached"):
+        searched = "、".join(str(item) for item in model_cache.get("searched_dirs") or [])
+        issues.append(
+            {
+                "key": "weights",
+                "label": f"本机没有 {MODEL_NAME} 权重，第一次分离要先联网下载（约 80 MB）",
+                "severity": "warning",
+                "detail": f"找过这些目录：{searched or '无'}。完全离线的机器请先在有网时跑通一次，再把缓存目录整体复制过去。",
+                "command": f'"{interpreter}" -m demucs --name {MODEL_NAME} -o "<一个空目录>" "<任意音频>"',
+            }
+        )
+
+    if environment.get("outputs_writable") is False:
+        issues.append(
+            {
+                "key": "disk_write",
+                "label": "输出目录写不进去，分离结果存不下来",
+                "severity": "blocking",
+                "detail": f"目录：{environment.get('outputs_dir')}",
+                "command": f'用 VOCAL_SEPARATOR_DATA_DIR 指到一个可写目录，例如 set "VOCAL_SEPARATOR_DATA_DIR=D:\\声析数据"',
+            }
+        )
+    free_mb = environment.get("disk_free_mb")
+    if isinstance(free_mb, (int, float)) and free_mb < 1024:
+        issues.append(
+            {
+                "key": "disk_space",
+                "label": f"磁盘只剩 {free_mb} MB，四条 WAV 轨可能写不完",
+                "severity": "blocking" if free_mb < 200 else "warning",
+                "detail": f"输出目录：{environment.get('outputs_dir')}",
+                "command": "清理磁盘，或把 VOCAL_SEPARATOR_DATA_DIR 指到空间充足的盘",
+            }
+        )
+
+    return issues
+
+
 def probe_environment(force: bool = False) -> dict[str, Any]:
-    """返回缓存的环境探测结果；首次调用返回 probing 而不是卡住事件循环。"""
+    """返回缓存的环境探测结果；首次调用返回 probing 而不是卡住事件循环。
+
+    "探测中"不是失败：调用方按 `retry_after_seconds` 再问一次就能拿到实测值。
+    探测卡住或上次炸了（超过 30 秒还是 probing/failed）会自动补一次后台探测，
+    不至于让界面永远停在"正在检测"。
+    """
     with env_probe_lock:
         cached = dict(ENV_PROBE)
-    if cached.get("status") == "ready" and not force:
-        return cached
-    if force:
+        started_at = _probe_state["started_at"]
+        inflight = _probe_state["inflight"]
+    if cached.get("status") == "ready" or force:
+        if not force:
+            return cached
         result = _compute_environment()
         with env_probe_lock:
             ENV_PROBE.clear()
             ENV_PROBE.update(result)
         return dict(result)
+    stale = started_at is not None and (time.time() - started_at) > PROBE_STALE_SECONDS
+    if cached.get("status") in {"probing", "failed"} and (stale or started_at is None) and not inflight:
+        _start_environment_probe()
     return cached
 
 
+def _start_environment_probe() -> None:
+    with env_probe_lock:
+        if _probe_state["inflight"]:
+            return
+        _probe_state["inflight"] = True
+        _probe_state["started_at"] = time.time()
+    threading.Thread(target=_probe_environment_in_background, name="vocal-env-probe", daemon=True).start()
+
+
 def _probe_environment_in_background() -> None:
+    requirements = str(BASE_DIR / "requirements.txt")
     try:
         result = _compute_environment()
     except Exception as exc:  # 探测失败也要留痕，界面上好解释
-        result = {"status": "failed", "error": str(exc), "probed_at": time.time()}
+        result = {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "probed_at": time.time(),
+            "issues": [
+                {
+                    "key": "probe",
+                    "label": "环境探测本身失败了",
+                    "severity": "blocking",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "command": f'"{sys.executable}" -m pip install -r "{requirements}"',
+                }
+            ],
+        }
     with env_probe_lock:
         ENV_PROBE.clear()
         ENV_PROBE.update(result)
+        _probe_state["inflight"] = False
 
 
 # ────────────────────────────── 任务表 ──────────────────────────────
@@ -321,19 +505,34 @@ def _update_job(job_id: str, **changes: Any) -> None:
 
 
 def _queue_position(job_id: str) -> int:
+    """前面还压着几个任务。
+
+    正在占显卡的那个也算：以前只数 status=="queued" 的同类，于是"排在一首后面"
+    报成 0，界面写"前面还有 0 首"，用户以为马上轮到自己。
+    """
     with jobs_lock:
         job = jobs.get(job_id)
         if job is None:
             return 0
         created_at = job.get("created_at", 0)
+        active = {"queued", "processing", "cancelling"}
         ahead = [
-            other
+            other_id
             for other_id, other in jobs.items()
             if other_id != job_id
-            and other.get("status") == "queued"
-            and other.get("created_at", 0) <= created_at
+            and other.get("status") in active
+            and (
+                other.get("created_at", 0) < created_at
+                or (other.get("created_at", 0) == created_at and other_id < job_id)
+            )
         ]
     return len(ahead)
+
+
+def job_progress(job_id: str) -> int:
+    """当前进度值；Demucs 会打多条进度条，任务进度只往前走不回退。"""
+    with jobs_lock:
+        return int((jobs.get(job_id) or {}).get("progress", 0) or 0)
 
 
 def _public_job(job_id: str) -> dict[str, Any] | None:
@@ -350,7 +549,9 @@ def _public_job(job_id: str) -> dict[str, Any] | None:
         elapsed = round(time.time() - started_at, 1) if started_at and status_name not in {"done", "error", "cancelled"} else job.get("elapsed_seconds")
         created_at = job.get("created_at", 0)
         eta_seconds: float | None = None
-        if status_name in {"queued", "processing"} and progress >= 8 and elapsed and progress < 100:
+        # 只有真的量到一步以上才外推剩余时间：否则"约剩 45 秒"会随已用时间一路往上涨，
+        # 那是看着比没有更慌的假承诺。
+        if status_name in {"queued", "processing"} and progress >= 20 and elapsed and progress < 100:
             eta_seconds = round(max(elapsed * (100 - progress) / progress, 0), 1)
         snapshot = {
             "job_id": job_id,
@@ -647,6 +848,83 @@ def _close_pipe(process: Any) -> None:
             pass
 
 
+def child_environment() -> dict[str, str]:
+    """给子进程一份确定的环境。
+
+    Windows 上把 stdout 重进管道后 Python 默认按 GBK 写、而且块缓冲到进程退出才刷出来：
+    前者会让后端原文变成乱码，后者让"加载模型/分离中"这些阶段话到最后一刻才露面。
+    进度条本身是 tqdm 显式 flush 的，所以实时性靠这一份环境补齐。
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+
+
+def _terminate_process(process: Any) -> None:
+    """真的把子进程按下去：terminate -> 等它落地 -> 还没死就 kill。
+
+    只 terminate 不 wait 的话，Windows 上它可能还在写那个 WAV，紧接着的删除就会
+    撞 PermissionError，半成品留在盘上。
+    """
+    if process is None:
+        return
+    try:
+        if process.poll() is not None:
+            return
+    except (OSError, ValueError):
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        process.kill()
+    except (OSError, AttributeError):
+        return
+    try:
+        process.wait(timeout=5)
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        pass
+
+
+def _remove_quiet(target: Path) -> None:
+    """删文件或目录；被占用/已经没了都不影响主流程（槽位释放比这重要）。"""
+    try:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def acquire_separation_slot(job_id: str) -> str:
+    """拿分离槽位，返回 acquired / cancelled / timeout。
+
+    排队中的任务以前只在开工前检查一次取消标记，于是"取消一首排队的歌"会静默失效——
+    槽位一空出来照样把整首跑完，白占显卡。这里改成每秒回看一次取消。
+    """
+    deadline = time.time() + FILE_TTL_SECONDS
+    while True:
+        if _job_cancel_requested(job_id):
+            return "cancelled"
+        if SEPARATION_SLOTS.acquire(timeout=SLOT_POLL_SECONDS):
+            if _job_cancel_requested(job_id):
+                SEPARATION_SLOTS.release()
+                return "cancelled"
+            return "acquired"
+        if time.time() >= deadline:
+            return "timeout"
+
+
+def output_tail(lines: Any) -> str:
+    """把子进程的原始输出收成一段可读文本（保留最后几行，不截断单行）。"""
+    return "\n".join(str(line).rstrip() for line in list(lines)[-ERROR_OUTPUT_TAIL:] if str(line).strip())
+
+
 def _demucs_phase(line: str) -> str | None:
     lowered = line.lower()
     if "downloading" in lowered:
@@ -654,6 +932,18 @@ def _demucs_phase(line: str) -> str | None:
     if "separating track" in lowered or "applying" in lowered or "%|" in lowered:
         return "separating"
     return None
+
+
+def demucs_progress(line: str) -> int | None:
+    """把 Demucs 自己打印的百分比换成任务进度；这一行没有百分比就返回 None。
+
+    进度不是假装的：加载模型占前 10%，Demucs 的实测推进度映射到 10-95%，
+    写完音轨文件才给 97%，100% 只在四条轨都落到磁盘上之后给。
+    """
+    match = PROGRESS_PATTERN.search(line)
+    if not match:
+        return None
+    return max(10, min(10 + int(int(match.group(1)) * 0.85), 95))
 
 
 def convert_video_to_audio(job_id: str, input_path: Path) -> Path:
@@ -681,22 +971,24 @@ def convert_video_to_audio(job_id: str, input_path: Path) -> Path:
         str(audio_path),
     ]
 
-    output_lines: list[str] = []
+    output_lines: deque[str] = deque(maxlen=ERROR_OUTPUT_TAIL)
+    process = None
     try:
-        process = subprocess.Popen(
+        process = subprocess.Popen(  # noqa: S603
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=child_environment(),
         )
         _update_job(job_id, process=process)
 
         if process.stdout is not None:
             for line in process.stdout:
                 if _job_cancel_requested(job_id):
-                    process.terminate()
+                    _terminate_process(process)
                     raise SeparationCancelled
                 clean_line = line.strip()
                 if clean_line:
@@ -707,15 +999,45 @@ def convert_video_to_audio(job_id: str, input_path: Path) -> Path:
         if _job_cancel_requested(job_id):
             raise SeparationCancelled
         if return_code != 0:
-            detail = "\n".join(output_lines[-8:])
-            raise RuntimeError(detail or f"ffmpeg 退出码：{return_code}")
+            raise RuntimeError(output_tail(output_lines) or f"ffmpeg 退出码：{return_code}")
     except SeparationCancelled:
-        audio_path.unlink(missing_ok=True)
+        _terminate_process(process)
+        _remove_quiet(audio_path)
         raise
 
     if not audio_path.is_file() or audio_path.stat().st_size == 0:
-        raise RuntimeError("视频转换音频失败：未生成有效音轨")
+        raise RuntimeError(
+            "视频里没有可用的音轨（或该视频编码 ffmpeg 读不了）。"
+            "可以先用别的工具导出音频再上传，或换一个 ffmpeg 构建。"
+        )
     return audio_path
+
+
+def failure_remedy(detail: str, return_code: int) -> str:
+    """失败原因 = 原始输出最后几行 + 一句能执行的出路。
+
+    只贴 traceback 等于把排查工作丢回给用户；这里按真实报错特征给具体命令，
+    认不出来的情况原样把输出交出去（不编造原因）。
+    """
+    head = f"Demucs 退出码：{return_code}"
+    body = detail or head
+    lowered = detail.lower()
+    hint = None
+    if "no module named" in lowered and "demucs" in lowered:
+        hint = f"后端用的 Python 里没有 Demucs：\"{sys.executable}\" -m pip install -r \"{BASE_DIR / 'requirements.txt'}\""
+    elif "no module named" in lowered and "torch" in lowered:
+        hint = f"后端用的 Python 里没有 PyTorch：\"{sys.executable}\" -m pip install -r \"{BASE_DIR / 'requirements.txt'}\""
+    elif "out of memory" in lowered:
+        hint = "显存不够：先关掉其它占显卡的程序再重试；还不行就用 CPU 分离（慢很多，但能跑完）。"
+    elif "no kernel image" in lowered or "cuda error" in lowered or "cudnn" in lowered:
+        hint = f"PyTorch 与本机显卡驱动/CUDA 版本不匹配：重装轮子 \"{sys.executable}\" -m pip install -r \"{BASE_DIR / 'requirements.txt'}\""
+    elif "not a valid file" in lowered or "unable to find a suitable" in lowered or "corrupt" in lowered:
+        hint = "这个文件读不出来：确认它没被下载截断，或先导出一条 WAV 再分离。"
+    elif "permission denied" in lowered or "winerror 5" in lowered:
+        hint = "输出目录写不进去：释放该目录权限，或用 VOCAL_SEPARATOR_DATA_DIR 指到可写的盘。"
+    if hint:
+        return f"{body}\n下一步：{hint}"
+    return body
 
 
 def run_separation(job_id: str, input_path: Path) -> None:
@@ -723,9 +1045,9 @@ def run_separation(job_id: str, input_path: Path) -> None:
     work_dir = OUTPUTS_DIR / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
     if _job_cancel_requested(job_id):
-        shutil.rmtree(work_dir, ignore_errors=True)
-        input_path.unlink(missing_ok=True)
-        _update_job(job_id, status="cancelled", progress=0, phase="cancelled", error=None)
+        _remove_quiet(work_dir)
+        _remove_quiet(input_path)
+        _update_job(job_id, status="cancelled", progress=0, phase="cancelled", error=None, finished_at=time.time())
         return
 
     with jobs_lock:
@@ -733,17 +1055,29 @@ def run_separation(job_id: str, input_path: Path) -> None:
         preset_name = job.get("preset", DEFAULT_PRESET)
         stem_names = tuple(job.get("stem_names", PRESETS[preset_name]["stems"]))
 
-    if not SEPARATION_SLOTS.acquire(timeout=FILE_TTL_SECONDS):
-        shutil.rmtree(work_dir, ignore_errors=True)
-        input_path.unlink(missing_ok=True)
-        _update_job(job_id, status="error", progress=0, phase="failed", error="排队等待超过 1 小时，任务已放弃。")
+    slot = acquire_separation_slot(job_id)
+    if slot != "acquired":
+        _remove_quiet(work_dir)
+        _remove_quiet(input_path)
+        if slot == "cancelled":
+            _update_job(job_id, status="cancelled", progress=0, phase="cancelled", error=None, finished_at=time.time())
+        else:
+            _update_job(
+                job_id,
+                status="error",
+                progress=0,
+                phase="failed",
+                error=f"排队等待超过 {FILE_TTL_SECONDS // 60} 分钟，任务已放弃。前面如果有任务卡住，可以取消它。",
+                finished_at=time.time(),
+            )
         return
 
     _update_job(job_id, status="processing", progress=2, phase="loading_model", running_at=time.time())
 
     audio_path = input_path
     command: list[str] = []
-    output_lines: list[str] = []
+    output_lines: deque[str] = deque(maxlen=ERROR_OUTPUT_TAIL)
+    process = None
     try:
         if input_path.suffix.lower() in VIDEO_EXTENSIONS:
             audio_path = convert_video_to_audio(job_id, input_path)
@@ -763,20 +1097,21 @@ def run_separation(job_id: str, input_path: Path) -> None:
             command += ["--two-stems", two_stems]
         command.append(str(audio_path))
 
-        process = subprocess.Popen(
+        process = subprocess.Popen(  # noqa: S603
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=child_environment(),
         )
         _update_job(job_id, process=process)
 
         if process.stdout is not None:
             for line in process.stdout:
                 if _job_cancel_requested(job_id):
-                    process.terminate()
+                    _terminate_process(process)
                     raise SeparationCancelled
                 clean_line = line.strip()
                 if clean_line:
@@ -785,10 +1120,14 @@ def run_separation(job_id: str, input_path: Path) -> None:
                 phase = _demucs_phase(clean_line)
                 if phase:
                     changes["phase"] = phase
-                match = PROGRESS_PATTERN.search(clean_line)
-                if match:
-                    # Demucs 自己那 0-100% 映射到任务的 10-95%，前面留给加载/下载，后面留给写文件。
-                    changes["progress"] = max(10, min(10 + int(int(match.group(1)) * 0.85), 95))
+                step = demucs_progress(clean_line)
+                if step is None and phase == "separating":
+                    # Demucs 刚说"Separating track"时进度条还没开画，
+                    # 下限给它映射的起点 10%，别让阶段写着"分离音轨"而进度停在 2%。
+                    step = 10
+                if step is not None:
+                    # 只往前走，不回退（Demucs 每条轨各起一个进度条）。
+                    changes["progress"] = max(job_progress(job_id), step)
                 if changes:
                     _update_job(job_id, **changes)
 
@@ -797,13 +1136,15 @@ def run_separation(job_id: str, input_path: Path) -> None:
         if _job_cancel_requested(job_id):
             raise SeparationCancelled
         if return_code != 0:
-            detail = "\n".join(output_lines[-8:])
-            raise RuntimeError(detail or f"Demucs 退出码：{return_code}")
+            raise RuntimeError(failure_remedy(output_tail(output_lines), return_code))
 
         _update_job(job_id, progress=97, phase="writing")
         result_dir = work_dir / MODEL_NAME / input_path.stem
         if not result_dir.is_dir():
-            raise RuntimeError("未找到 Demucs 输出目录")
+            raise RuntimeError(
+                f"Demucs 跑完了但没找到输出目录（{result_dir}）。"
+                "多半是磁盘空间不足或该目录被安全软件拦下，请清理磁盘后重试。"
+            )
 
         stems_dir = work_dir / "stems"
         stems_dir.mkdir(exist_ok=True)
@@ -823,7 +1164,10 @@ def run_separation(job_id: str, input_path: Path) -> None:
             }
 
         if not stems:
-            raise RuntimeError("分离完成，但未生成任何音轨文件")
+            raise RuntimeError(
+                f"分离跑完了，但 {result_dir} 里一条音轨都没有；"
+                "请确认输入文件不是 0 秒或纯静音，然后重试。"
+            )
 
         shutil.rmtree(work_dir / MODEL_NAME, ignore_errors=True)
         finished_at = time.time()
@@ -842,10 +1186,12 @@ def run_separation(job_id: str, input_path: Path) -> None:
         )
         append_history(job_id)
     except SeparationCancelled:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # 先把状态落定再收尾：清理半成品可能因为文件还被占着而失败，
+        # 但那不该让用户一直看到"处理中"，更不该把显卡槽位一起带走。
         _update_job(job_id, status="cancelled", progress=0, phase="cancelled", error=None, finished_at=time.time())
+        _terminate_process(process)
+        _remove_quiet(work_dir)
     except Exception as exc:
-        shutil.rmtree(work_dir, ignore_errors=True)
         _update_job(
             job_id,
             status="error",
@@ -854,12 +1200,18 @@ def run_separation(job_id: str, input_path: Path) -> None:
             error=f"音轨分离失败：{exc}",
             finished_at=time.time(),
         )
+        _terminate_process(process)
+        _remove_quiet(work_dir)
     finally:
+        # 槽位必须还回去：Windows 上删一个还被子进程占着的 WAV 会抛 PermissionError，
+        # 以前它会把整个 finally 打断，显卡槽位从此没人能拿到，后面所有任务永远排队。
         _update_job(job_id, process=None)
-        input_path.unlink(missing_ok=True)
-        if audio_path != input_path:
-            audio_path.unlink(missing_ok=True)
-        SEPARATION_SLOTS.release()
+        try:
+            _remove_quiet(input_path)
+            if audio_path != input_path:
+                _remove_quiet(audio_path)
+        finally:
+            SEPARATION_SLOTS.release()
 
 
 def cancel_job(job_id: str) -> dict[str, Any]:
@@ -880,7 +1232,8 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         job["updated_at"] = time.time()
         process = job.get("process")
 
-    if process is not None and process.poll() is None:
+    was_running = process is not None and process.poll() is None
+    if was_running:
         try:
             process.terminate()
         except OSError:
@@ -894,6 +1247,12 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         "phase_label": PHASE_LABELS["cancelled"],
         "error": None,
         "stems": {},
+        "was_running": was_running,
+        "note": (
+            "已终止在跑的 Demucs 子进程，该任务的输出目录会被清掉。"
+            if was_running
+            else "这一首还在排队、没占用显卡：线程每秒查一次取消标记，最多 1 秒后就会放弃。"
+        ),
     }
 
 
@@ -903,9 +1262,8 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     cleanup_old_files()
-    probe_environment()
+    _start_environment_probe()
     cleanup_stop.clear()
-    threading.Thread(target=_probe_environment_in_background, name="vocal-env-probe", daemon=True).start()
     threading.Thread(target=_cleanup_loop, name="vocal-cleanup", daemon=True).start()
     try:
         import agent_api
@@ -998,7 +1356,7 @@ async def separate_audio(
                         "文件超过 500 MB，请压缩后再试",
                     )
                 destination.write(chunk)
-    except HTTPException:
+    except (HTTPException, asyncio.CancelledError):
         input_path.unlink(missing_ok=True)
         with jobs_lock:
             jobs.pop(job_id, None)

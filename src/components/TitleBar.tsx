@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 interface VocalShell {
   windowControls: {
@@ -17,6 +17,11 @@ function shell(): VocalShell | null {
     ? ((window as unknown as { vocal: VocalShell }).vocal)
     : null;
 }
+
+// Electron installs this immutable bridge before the page loads. Hydration must
+// still start with the same empty controls as the server-rendered HTML.
+const subscribeShell = () => () => {};
+const serverShell = () => null;
 
 function useMaximized(): boolean {
   const [maximized, setMaximized] = useState(false);
@@ -35,7 +40,7 @@ const btn =
 /** 窗口三键簇：嵌入应用自己的头部行。 */
 export function WindowControls() {
   const maximized = useMaximized();
-  const s = shell();
+  const s = useSyncExternalStore(subscribeShell, shell, serverShell);
   if (!s) return null;
   const btn =
     "grid h-8 w-11 place-items-center text-white/50 transition-colors hover:bg-white/10 hover:text-white";

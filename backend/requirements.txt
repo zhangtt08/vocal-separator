@@ -1,8 +1,28 @@
+# Backend dependencies for the vocal-separator (ShengXi) local service.
+# Versions are pinned to the ones actually verified on the reference machine in
+# this round (Python 3.12.4 / torch 2.6.0+cu124 / demucs 4.1.0). The UI and the
+# Agent tools point users at exactly this file, so it must install a working set:
+#     "<python>" -m pip install -r backend/requirements.txt
+#
+# ASCII only on purpose: pip decodes requirements files with the machine's
+# locale (GBK on zh-CN Windows), so non-ASCII comments can break the install.
+#
+# Requires Python 3.10 - 3.12 (demucs 4.1 drops 3.9).
+# Without an NVIDIA GPU, drop the "+cu124" local suffix from the torch line to
+# get the CPU wheels (works, roughly 10-30x slower).
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.5.1+cu124
-torchaudio==2.5.1+cu124
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.19
-demucs==4.0.1
-imageio-ffmpeg==0.5.1
+torch==2.6.0+cu124
+demucs==4.1.0
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+python-multipart==0.0.32
+
+# torchaudio is intentionally NOT listed: demucs 4.1 decodes with sphn + ffmpeg
+# and the verified machine has no torchaudio installed. The previous pin
+# (2.5.1+cu124 / demucs 4.0.1) was a stale snapshot and would have downgraded a
+# working torch when followed.
+#
+# ffmpeg is not a pip dependency. The backend looks for
+# VOCAL_SEPARATOR_FFMPEG, then backend/ffmpeg.exe, then PATH.
+# Model weights (htdemucs, ~80 MB) are fetched by demucs into the local HF cache
+# on the first run and are used fully offline afterwards.

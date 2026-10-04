@@ -113,6 +113,14 @@ interface PresetInfo {
   stems: PresetStem[];
 }
 
+interface EnvIssue {
+  key: string;
+  label: string;
+  severity: "blocking" | "warning";
+  detail?: string | null;
+  command?: string | null;
+}
+
 interface HealthInfo {
   status?: string;
   demucs_available?: boolean;
@@ -129,6 +137,8 @@ interface HealthInfo {
   version?: string;
   model?: string;
   presets?: PresetInfo[];
+  issues?: EnvIssue[];
+  can_separate?: boolean;
   model_cache?: {
     cached?: boolean;
     size_mb?: number;
@@ -344,9 +354,10 @@ export function VocalWorkspace() {
   const [health, setHealth] = useState<HealthInfo | null>(null);
   const [serviceState, setServiceState] = useState<ServiceState>("checking");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  // 历史默认摊开：首屏就该看得到"本机有什么结果"，而不是先猜再点一个折叠按钮。
+  const [historyOpen, setHistoryOpen] = useState(true);
   const [saving, setSaving] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; tone: "ok" | "warn" } | null>(null);
 
   const itemsRef = useRef<QueueItem[]>([]);
   const runningRef = useRef(false);
@@ -354,6 +365,7 @@ export function VocalWorkspace() {
   const abandonRef = useRef<Set<string>>(new Set());
   const serviceControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const presetRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const dragDepthRef = useRef(0);
   const [isDragging, setIsDragging] = useState(false);
   const mountedRef = useRef(true);
@@ -611,7 +623,7 @@ export function VocalWorkspace() {
       dragDepthRef.current = 0;
       setIsDragging(false);
       if (serviceState !== "online") {
-        setNotice("本地 AI 服务尚未就绪，请先看上面的提示。");
+        setNotice({ text: "本地 AI 服务尚未就绪，请先看上面的提示。", tone: "warn" });
         return;
       }
       const files = Array.from(event.dataTransfer.files || []);
@@ -620,11 +632,28 @@ export function VocalWorkspace() {
     [enqueue, serviceState],
   );
 
-  const removeItem = useCallback((key: string) => {
-    abandonRef.current.add(key);
-    setItems((current) => current.filter((entry) => entry.key !== key));
-    setSelectedKey((current) => (current === key ? null : current));
-  }, []);
+  /** 从队列里划掉一行。正在跑的那首必须同时通知后端取消，否则它会继续在背后占显卡。 */
+  const removeItem = useCallback(
+    (key: string) => {
+      const item = itemsRef.current.find((entry) => entry.key === key);
+      abandonRef.current.add(key);
+      setItems((current) => current.filter((entry) => entry.key !== key));
+      setSelectedKey((current) => (current === key ? null : current));
+      const jobId = item?.job?.job_id;
+      if (jobId && item && (item.state === "processing" || item.state === "uploading")) {
+        void fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "POST" }).catch(() => null);
+      }
+    },
+    [],
+  );
+
+  const retryItem = useCallback(
+    (key: string) => {
+      abandonRef.current.delete(key);
+      patch(key, { state: "waiting", error: null, uploadPct: 0, job: undefined });
+    },
+    [patch],
+  );
 
   const cancelItem = useCallback(
     async (key: string, jobId?: string) => {
@@ -671,9 +700,10 @@ export function VocalWorkspace() {
       ]);
       setSelectedKey(key);
     } catch (loadError) {
-      setNotice(
-        `这条结果的任务记录已经不在了（${friendlyError(loadError, "任务不存在或已过期")}），文件路径：${entry.output_dir || "未知"}`,
-      );
+      setNotice({
+        text: `这条结果的任务记录已经不在了（${friendlyError(loadError, "任务不存在或已过期")}），文件路径：${entry.output_dir || "未知"}`,
+        tone: "warn",
+      });
     }
   }, []);
 
@@ -695,9 +725,9 @@ export function VocalWorkspace() {
         const result = await shell.saveStem({ jobId, stem: stemKey, suggestedName });
         setSaving(null);
         if (result.saved && result.path) {
-          setNotice(`已保存：${result.path}（${formatSize(result.bytes)}）`);
+          setNotice({ text: `已保存：${result.path}（${formatSize(result.bytes)}）`, tone: "ok" });
         } else if (result.reason && result.reason !== "cancelled") {
-          setNotice(result.reason);
+          setNotice({ text: result.reason, tone: "warn" });
         }
         return;
       }
@@ -719,7 +749,10 @@ export function VocalWorkspace() {
         anchor.remove();
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
       } catch (downloadError) {
-        setNotice(friendlyError(downloadError, "下载失败，请稍后重试。"));
+        setNotice({
+          text: friendlyError(downloadError, "下载失败，请稍后重试。"),
+          tone: "warn",
+        });
       } finally {
         setSaving(null);
       }
@@ -747,6 +780,7 @@ export function VocalWorkspace() {
   })();
 
   const isDesktop = !!shellApi()?.saveStem;
+  const issues = health?.issues || [];
   const environment = health
     ? [
         health.demucs_version ? `Demucs ${health.demucs_version}` : "Demucs 版本未知",
@@ -819,6 +853,25 @@ export function VocalWorkspace() {
             </p>
           )}
 
+          {serviceState === "online" && issues.length > 0 && (
+            <ul className="env-issues" aria-label="本机环境待办">
+              {issues.map((issue) => (
+                <li key={issue.key} data-severity={issue.severity}>
+                  <span className="env-issue-head">
+                    {issue.severity === "blocking" ? (
+                      <TriangleAlert aria-hidden="true" />
+                    ) : (
+                      <Clock3 aria-hidden="true" />
+                    )}
+                    <span>{issue.label}</span>
+                  </span>
+                  {issue.detail && <span className="env-issue-detail">{issue.detail}</span>}
+                  {issue.command && <code className="command-text">{issue.command}</code>}
+                </li>
+              ))}
+            </ul>
+          )}
+
           {serviceState !== "online" && (
             <div className="service-notice" data-state={serviceState} role="status">
               <span className="flex min-w-0 flex-col gap-1">
@@ -860,7 +913,7 @@ export function VocalWorkspace() {
 
           {presets.length > 0 && (
             <div className="preset-picker" role="radiogroup" aria-label="音轨预设">
-              {presets.map((entry) => (
+              {presets.map((entry, index) => (
                 <button
                   key={entry.preset}
                   type="button"
@@ -868,6 +921,24 @@ export function VocalWorkspace() {
                   aria-checked={preset === entry.preset}
                   data-state={preset === entry.preset ? "on" : "off"}
                   className="preset-option"
+                  ref={(node) => {
+                    presetRefs.current[index] = node;
+                  }}
+                  // radiogroup 的键盘约定是一枚 Tab 停靠点 + 方向键换档。
+                  tabIndex={preset === entry.preset ? 0 : -1}
+                  onKeyDown={(event) => {
+                    const step =
+                      event.key === "ArrowRight" || event.key === "ArrowDown"
+                        ? 1
+                        : event.key === "ArrowLeft" || event.key === "ArrowUp"
+                          ? -1
+                          : 0;
+                    if (!step || presets.length < 2) return;
+                    event.preventDefault();
+                    const next = (index + step + presets.length) % presets.length;
+                    setPresetChoice(presets[next].preset);
+                    presetRefs.current[next]?.focus();
+                  }}
                   onClick={() => setPresetChoice(entry.preset)}
                   disabled={!!busyItem && preset !== entry.preset}
                 >
@@ -972,7 +1043,7 @@ export function VocalWorkspace() {
                               ? ` · 已用 ${formatDuration(job.elapsed_seconds)}`
                               : ""
                           }${(job?.queue_position || 0) > 0 ? ` · 前面还有 ${job?.queue_position} 首` : ""}`}
-                        {item.state === "done" && `完成 · ${visibleStemCount(item)} 条音轨`}
+                        {item.state === "done" && doneSummary(item)}
                         {item.state === "error" && "失败"}
                         {item.state === "cancelled" && "已取消"}
                       </span>
@@ -999,6 +1070,9 @@ export function VocalWorkspace() {
                               看上次结果
                             </Button>
                           )}
+                          <Button size="sm" variant="ghost" onClick={() => removeItem(item.key)}>
+                            不要了
+                          </Button>
                         </>
                       )}
                       {(item.state === "processing" || item.state === "uploading") && (
@@ -1009,6 +1083,18 @@ export function VocalWorkspace() {
                         >
                           <X data-icon="inline-start" />
                           取消
+                        </Button>
+                      )}
+                      {item.state === "waiting" && (
+                        <Button size="sm" variant="ghost" onClick={() => removeItem(item.key)}>
+                          <X data-icon="inline-start" />
+                          移出队列
+                        </Button>
+                      )}
+                      {item.state === "error" && item.file && (
+                        <Button size="sm" variant="outline" onClick={() => retryItem(item.key)}>
+                          <RefreshCw data-icon="inline-start" />
+                          重试
                         </Button>
                       )}
                       {["done", "error", "cancelled"].includes(item.state) && (
@@ -1068,10 +1154,14 @@ export function VocalWorkspace() {
           )}
 
           {notice && (
-            <p className="service-notice" role="status">
+            <p className="service-notice" data-tone={notice.tone} role="status">
               <span className="flex min-w-0 items-start gap-2">
-                <Check aria-hidden="true" />
-                <span className="min-w-0 break-all">{notice}</span>
+                {notice.tone === "warn" ? (
+                  <TriangleAlert aria-hidden="true" />
+                ) : (
+                  <CircleCheck aria-hidden="true" />
+                )}
+                <span className="min-w-0 break-all">{notice.text}</span>
               </span>
               <Button size="sm" variant="ghost" onClick={() => setNotice(null)}>
                 知道了
@@ -1115,10 +1205,13 @@ export function VocalWorkspace() {
                   const meta = STEM_META[stemKey] || { label: stemKey, icon: Music2 };
                   const Icon = meta.icon;
                   const label = stem.label || meta.label;
+                  // 后端的 exists 是当场对磁盘 stat 出来的：文件被移走就照实说没了，
+                  // 而不是摆一个点了必然失败的播放器。
+                  const missing = stem.exists === false;
                   const audioUrl = `${API_BASE}/api/download/${shownJob.job_id}/${encodeURIComponent(stemKey)}`;
 
                   return (
-                    <article key={stemKey} className="stem-row">
+                    <article key={stemKey} className="stem-row" data-missing={missing ? "true" : "false"}>
                       <span
                         className="stem-icon"
                         data-stem={stemKey}
@@ -1129,22 +1222,34 @@ export function VocalWorkspace() {
                       <div className="min-w-0 flex-1">
                         <h3 className="font-heading text-sm font-medium">{label}</h3>
                         <p className="text-xs text-muted-foreground tabular-nums">
-                          WAV，{formatSize(stem.bytes ?? (stem.size_mb || 0) * 1024 * 1024)}
+                          {missing
+                            ? "结果已不存在（超过 1 小时自动清理，或文件被移走）"
+                            : `WAV，${formatSize(stem.bytes ?? (stem.size_mb || 0) * 1024 * 1024)}`}
                         </p>
                       </div>
-                      <audio
-                        controls
-                        preload="none"
-                        className="audio-player"
-                        aria-label={`试听${label}`}
-                        src={audioUrl}
-                      />
+                      {missing ? null : (
+                        <audio
+                          controls
+                          preload="none"
+                          className="audio-player"
+                          aria-label={`试听${label}`}
+                          src={audioUrl}
+                        />
+                      )}
                       <Button
                         variant="outline"
-                        disabled={saving === stemKey}
+                        disabled={saving === stemKey || missing}
                         aria-busy={saving === stemKey}
                         onClick={() => void exportStem(shownJob.job_id, stemKey, label, shownSource, isDesktop)}
-                        aria-label={saving === stemKey ? `正在导出${label}` : isDesktop ? `保存${label}` : `下载${label}`}
+                        aria-label={
+                          missing
+                            ? `${label}的结果文件已不存在`
+                            : saving === stemKey
+                              ? `正在导出${label}`
+                              : isDesktop
+                                ? `保存${label}`
+                                : `下载${label}`
+                        }
                       >
                         {saving === stemKey ? (
                           "正在导出"
@@ -1264,6 +1369,17 @@ function presetLabel(presets: PresetInfo[], preset?: string) {
   return presets.find((entry) => entry.preset === preset)?.label || preset;
 }
 
-function visibleStemCount(item: QueueItem) {
-  return Object.keys(item.job?.stems || {}).length;
+/** 音轨还在不在磁盘上——后端每条轨都带当场 stat 出来的 exists。 */
+function stemInventory(stems?: Record<string, StemInfo>) {
+  const entries = Object.values(stems || {});
+  const missing = entries.filter((info) => info.exists === false).length;
+  return { total: entries.length, missing };
+}
+
+function doneSummary(item: QueueItem) {
+  const { total, missing } = stemInventory(item.job?.stems);
+  if (total === 0) return "完成";
+  if (missing === total) return "结果已不存在（文件被移走或超时清理）";
+  if (missing > 0) return `完成 · ${total - missing}/${total} 条音轨还在本机`;
+  return `完成 · ${total} 条音轨`;
 }

@@ -484,6 +484,19 @@
     color: color-mix(in oklch, var(--signal) 72%, white);
   }
 
+  /* 回执条的语义色：成功用通过色，警告用失败色，和进度/结果条同一套 */
+  .service-notice[data-tone="ok"] {
+    color: var(--meter);
+    background: color-mix(in oklch, var(--meter) 8%, var(--panel));
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--meter) 24%, transparent);
+  }
+
+  .service-notice[data-tone="warn"] {
+    color: color-mix(in oklch, var(--destructive) 72%, white);
+    background: color-mix(in oklch, var(--destructive) 10%, var(--panel));
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--destructive) 26%, transparent);
+  }
+
   .processing-visual {
     position: relative;
     display: grid;
@@ -574,6 +587,21 @@
     box-shadow: 0 0 0 1px color-mix(in oklch, currentColor 24%, transparent);
   }
 
+  /* 结果文件已经不在了：压暗这一行，别让它看起来像还能用 */
+  .stem-row[data-missing="true"] {
+    background: color-mix(in oklch, var(--muted) 40%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--destructive) 22%, transparent);
+  }
+
+  .stem-row[data-missing="true"] .stem-icon {
+    color: var(--muted-foreground);
+    opacity: 0.6;
+  }
+
+  .stem-row[data-missing="true"] h3 {
+    color: var(--muted-foreground);
+  }
+
   .stem-icon[data-stem="vocals"] {
     color: var(--track-vocals);
   }
@@ -623,6 +651,58 @@
 
   .env-strip-extra {
     color: var(--signal);
+  }
+
+  /* 环境待办：每条都带后端实测出来的原因与可执行命令 */
+  .env-issues {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    border-radius: 0.9rem;
+    background: color-mix(in oklch, var(--panel) 70%, transparent);
+    box-shadow: 0 0 0 1px var(--border);
+    padding: 0.6rem 0.7rem;
+    list-style: none;
+  }
+
+  .env-issues li {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .env-issues li + li {
+    border-top: 1px solid var(--border);
+    padding-top: 0.5rem;
+  }
+
+  .env-issue-head {
+    display: flex;
+    min-width: 0;
+    align-items: flex-start;
+    gap: 0.45rem;
+    font-size: 0.76rem;
+    line-height: 1.5;
+    color: var(--signal);
+  }
+
+  .env-issue-head svg {
+    width: 0.9rem;
+    height: 0.9rem;
+    flex: none;
+    margin-top: 0.12rem;
+  }
+
+  .env-issues li[data-severity="blocking"] .env-issue-head {
+    color: color-mix(in oklch, var(--destructive) 74%, white);
+  }
+
+  .env-issue-detail {
+    font-size: 0.7rem;
+    line-height: 1.55;
+    color: var(--muted-foreground);
+    overflow-wrap: anywhere;
   }
 
   .command-text {

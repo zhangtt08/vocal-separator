@@ -113,19 +113,30 @@ def _wait_for_terminal(main: Any, job_id: str, timeout_seconds: int, poll_second
 def _env_probe(input: dict[str, Any], _ctx: dict[str, Any]) -> dict[str, Any]:
     main = backend()
     environment = dict(main.probe_environment(force=bool(input.get("refresh"))))
-    if environment.get("status") != "ready":
-        # 后端刚起来时 torch 还在导入：如实说在探测，不猜结论。
-        threading_probe = environment.get("status", "probing")
+    status = environment.get("status", "probing")
+    if status != "ready":
+        if status == "failed":
+            # 探测本身炸了：把原因和重装命令交出去，别把它伪装成"还在探测"。
+            return {
+                "status": "failed",
+                "error": environment.get("error"),
+                "issues": environment.get("issues", []),
+                "retry_after_seconds": 15,
+                "note": "环境探测失败，原因见 error；修好后传 refresh:true 重新探测。",
+                "python_executable": sys.executable,
+            }
+        # 后端刚起来时 torch 还在导入：如实说在探测，不猜结论，也不算失败。
         return {
-            "status": threading_probe,
+            "status": status,
             "retry_after_seconds": 5,
-            "note": "环境探测仍在进行（torch/CUDA 首次导入需要几秒），请稍后重试。",
+            "note": "环境探测仍在进行（torch/CUDA 首次导入需要几秒），按 retry_after_seconds 稍后再问一次即可拿到实测值。",
             "python_executable": sys.executable,
         }
     with main.jobs_lock:
         active = [job_id for job_id, job in main.jobs.items() if job.get("status") in {"queued", "processing", "cancelling"}]
     environment["active_jobs"] = len(active)
     environment["status"] = "ready"
+    environment["blocking_issues"] = [item for item in environment.get("issues", []) if item.get("severity") == "blocking"]
     return environment
 
 
@@ -168,6 +179,19 @@ def _separate_submit(input: dict[str, Any], _ctx: dict[str, Any]) -> dict[str, A
         raise AgentError("bad_input", f"未知 preset：{preset}；可用：{'、'.join(main.PRESETS)}")
 
     source = Path(str(input["input_path"]))
+    environment = main.probe_environment()
+    if environment.get("status") == "ready":
+        # 已知跑不了就别启动子进程白烧几分钟：把实测到的出路原样交回去。
+        blocking = [item for item in environment.get("issues", []) if item.get("severity") == "blocking"]
+        if blocking:
+            raise AgentError(
+                "environment_blocked",
+                "本机环境跑不了分离："
+                + "；".join(
+                    f"{item.get('label')}（下一步：{item.get('command') or '见 vocal.env_probe'}）"
+                    for item in blocking
+                ),
+            )
     try:
         job_id, working_copy = main.submit_source_file(source, preset)
     except FileNotFoundError as exc:
@@ -199,16 +223,17 @@ def _job_wait(input: dict[str, Any], _ctx: dict[str, Any]) -> dict[str, Any]:
 def _job_cancel(input: dict[str, Any], _ctx: dict[str, Any]) -> dict[str, Any]:
     main = backend()
     job_id = str(input["job_id"])
-    if main.job_snapshot(job_id) is None:
+    snapshot = main.job_snapshot(job_id)
+    if snapshot is None:
         raise AgentError("not_found", f"任务不存在或已过期：{job_id}")
-    snapshot = main.job_snapshot(job_id) or {}
-    if snapshot.get("terminal") or snapshot.get("status") in {"done", "error", "cancelled"}:
+    if snapshot.get("status") in {"done", "error", "cancelled"}:
         raise AgentError("conflict", f"任务已经结束了，无法取消（当前状态：{snapshot.get('status')}）")
     result = main.cancel_job(job_id)
     result["source_name"] = snapshot.get("source_name")
+    result["queue_position_before_cancel"] = snapshot.get("queue_position")
     result["note"] = (
-        "已请求取消：Demucs 子进程会被终止、该任务的输出目录会被清理；"
-        "提交时复制进 uploads 的那份副本会被删除，你本机选中的原文件不受影响。"
+        f"{result.get('note') or ''}"
+        "清理范围：该任务的输出目录、上传副本都会删除；你本机选中的原文件不受影响。"
     )
     return result
 

@@ -10,6 +10,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:backend": "python -m unittest discover -s backend -v",
+    "test:ui": "node scripts/test-window-controls.mjs",
     "agent:serve": "python agent/server.py",
     "agent:mcp": "node agent/mcp-server.mjs",
     "desktop": "npm run build && electron .",
