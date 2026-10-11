@@ -21,6 +21,14 @@ if errorlevel 1 goto missing_python
 where npm.cmd >nul 2>&1
 if errorlevel 1 goto missing_node
 
+if not exist "%APP_DIR%node_modules" (
+  echo Installing dependencies, this can take a few minutes...
+  pushd "%APP_DIR%"
+  call npm.cmd install --no-audit --no-fund
+  popd
+  if errorlevel 1 goto missing_node
+)
+
 echo [1/4] Checking Python backend...
 powershell -NoProfile -Command "if (Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" >nul 2>&1
 if not errorlevel 1 goto backend_running
