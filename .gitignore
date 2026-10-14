@@ -70,3 +70,5 @@ __pycache__/
 
 # 闸门共享令牌（本机后端与桌面壳之间；运行时生成，不入库）
 backend/security.json
+
+*.exe
