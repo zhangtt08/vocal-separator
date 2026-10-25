@@ -191,8 +191,10 @@ const STEM_META: Record<string, StemMeta> = {
   bass: { label: "贝斯", icon: Guitar },
   other: { label: "其他乐器", icon: Music2 },
   no_vocals: { label: "伴奏", icon: Headphones },
+  guitar: { label: "吉他", icon: Guitar },
+  piano: { label: "钢琴", icon: Music2 },
 };
-const STEM_ORDER = ["vocals", "no_vocals", "drums", "bass", "other"];
+const STEM_ORDER = ["vocals", "no_vocals", "drums", "bass", "guitar", "piano", "other"];
 
 /** 桌面壳（electron/preload.cjs）才有；浏览器模式返回 null，导出退回默认下载目录。 */
 interface DesktopShell {

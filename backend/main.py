@@ -61,12 +61,29 @@ PRESETS: dict[str, dict[str, Any]] = {
         "description": "人声 / 鼓组 / 贝斯 / 其他乐器，适合编曲与采样",
         "stems": STEM_NAMES,
         "two_stems": None,
+        "model": "htdemucs",
     },
     "vocal_backing": {
         "label": "人声 + 伴奏",
         "description": "两轨：清唱人声与去人声伴奏，适合翻唱与卡拉 OK",
         "stems": BACKING_STEM_NAMES,
         "two_stems": "vocals",
+        "model": "htdemucs",
+    },
+    "six_stems": {
+        "label": "六条音轨",
+        "description": "人声 / 鼓组 / 贝斯 / 吉他 / 钢琴 / 其他，适合乐手扒带与专业混音",
+        "stems": ("vocals", "drums", "bass", "guitar", "piano", "other"),
+        "two_stems": None,
+        "model": "htdemucs_6s",
+    },
+    "fine_tuned": {
+        "label": "精调高保真",
+        "description": "采用 Fine-tuned 模型并结合多重移位预测，极致抑制渗音与背景残留",
+        "stems": STEM_NAMES,
+        "two_stems": None,
+        "model": "htdemucs_ft",
+        "shifts": 1,
     },
 }
 DEFAULT_PRESET = "four_stems"
@@ -77,6 +94,8 @@ STEM_LABELS = {
     "bass": {"zh": "贝斯", "en": "bass"},
     "other": {"zh": "其他乐器", "en": "other"},
     "no_vocals": {"zh": "伴奏", "en": "instrumental"},
+    "guitar": {"zh": "吉他", "en": "guitar"},
+    "piano": {"zh": "钢琴", "en": "piano"},
 }
 
 # 任务状态里"被打断"专用一个阶段名，绝不复用 finished/failed 的措辞。
@@ -1503,6 +1522,8 @@ def run_separation(job_id: str, input_path: Path) -> None:
             audio_path = convert_video_to_audio(job_id, input_path, deadline_at=deadline_at)
             _update_job(job_id, progress=6, phase="loading_model")
 
+        preset_info = PRESETS.get(preset_name, PRESETS[DEFAULT_PRESET])
+        model_name = preset_info.get("model", MODEL_NAME)
         command = [
             sys.executable,
             "-m",
@@ -1510,11 +1531,14 @@ def run_separation(job_id: str, input_path: Path) -> None:
             "-o",
             str(work_dir),
             "--name",
-            MODEL_NAME,
+            model_name,
         ]
-        two_stems = PRESETS[preset_name].get("two_stems")
+        two_stems = preset_info.get("two_stems")
         if two_stems:
             command += ["--two-stems", two_stems]
+        shifts = preset_info.get("shifts")
+        if shifts and int(shifts) > 0:
+            command += ["--shifts", str(shifts)]
         command.append(str(audio_path))
 
         process = subprocess.Popen(  # noqa: S603
@@ -1557,7 +1581,7 @@ def run_separation(job_id: str, input_path: Path) -> None:
             raise RuntimeError(failure_remedy(output_tail(output_lines), return_code))
 
         _update_job(job_id, progress=97, phase="writing")
-        result_dir = work_dir / MODEL_NAME / input_path.stem
+        result_dir = work_dir / model_name / input_path.stem
         if not result_dir.is_dir():
             raise RuntimeError(
                 f"Demucs 跑完了但没找到输出目录（{result_dir}）。"
@@ -1587,7 +1611,7 @@ def run_separation(job_id: str, input_path: Path) -> None:
                 "请确认输入文件不是 0 秒或纯静音，然后重试。"
             )
 
-        shutil.rmtree(work_dir / MODEL_NAME, ignore_errors=True)
+        shutil.rmtree(work_dir / model_name, ignore_errors=True)
         finished_at = time.time()
         started_at = None
         with jobs_lock:
@@ -1875,7 +1899,11 @@ async def get_history(
 
 
 @app.get("/api/download/{job_id}/{stem_name}")
-async def download_stem(job_id: str, stem_name: str) -> FileResponse:
+async def download_stem(
+    job_id: str,
+    stem_name: str,
+    format: str = Query("wav", pattern=r"^(wav|mp3|flac)$"),
+) -> FileResponse:
     if not re.fullmatch(r"[0-9a-f]{12}", job_id) or not STEM_SAFE_PATTERN.match(stem_name):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "音轨文件不存在")
 
@@ -1888,11 +1916,69 @@ async def download_stem(job_id: str, stem_name: str) -> FileResponse:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "音轨文件不存在或已过期")
 
     source_stem = Path(str(job.get("source_name") or "声析音轨")).stem or "声析音轨"
+    target_format = format.lower()
+
+    if target_format == "wav":
+        return FileResponse(
+            file_path,
+            media_type="audio/wav",
+            filename=f"{source_stem}-{stem_name}.wav",
+        )
+
+    converted_path = OUTPUTS_DIR / job_id / "stems" / f"{stem_name}.{target_format}"
+    if not converted_path.is_file():
+        ffmpeg_bin = find_ffmpeg()
+        if ffmpeg_bin:
+            cmd = [ffmpeg_bin, "-y", "-i", str(file_path)]
+            if target_format == "mp3":
+                cmd.extend(["-b:a", "320k", str(converted_path)])
+            elif target_format == "flac":
+                cmd.extend(["-c:a", "flac", str(converted_path)])
+            try:
+                subprocess.run(cmd, check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                return FileResponse(file_path, media_type="audio/wav", filename=f"{source_stem}-{stem_name}.wav")
+        else:
+            return FileResponse(file_path, media_type="audio/wav", filename=f"{source_stem}-{stem_name}.wav")
+
+    media_type = "audio/mpeg" if target_format == "mp3" else "audio/flac"
     return FileResponse(
-        file_path,
-        media_type="audio/wav",
-        filename=f"{source_stem}-{stem_name}.wav",
+        converted_path,
+        media_type=media_type,
+        filename=f"{source_stem}-{stem_name}.{target_format}",
     )
+
+
+@app.delete("/api/history/{job_id}")
+async def delete_history_item(job_id: str) -> dict[str, Any]:
+    """删除指定的历史记录并回收其输出目录。"""
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "任务编号不合法")
+
+    removed = False
+    with history_lock:
+        entries = load_history()
+        new_entries = [e for e in entries if e.get("job_id") != job_id]
+        if len(new_entries) < len(entries):
+            _save_history(new_entries)
+            removed = True
+
+    with jobs_lock:
+        jobs.pop(job_id, None)
+    persist_queue()
+
+    out_dir = OUTPUTS_DIR / job_id
+    if out_dir.is_dir():
+        _remove_quiet(out_dir)
+
+    return {"status": "ok", "deleted": removed, "job_id": job_id}
+
+
+@app.post("/api/cleanup")
+async def manual_cleanup() -> dict[str, Any]:
+    """一键清理所有孤儿临时目录与失效缓存文件。"""
+    swept = sweep_partial_outputs()
+    return {"status": "ok", "swept": swept}
 
 
 try:  # Agent API 契约端点（同一进程、同一端口，不新增监听口）

@@ -72,3 +72,7 @@ __pycache__/
 backend/security.json
 
 *.exe
+
+# 任务队列运行时状态
+backend/queue.json
+queue.json

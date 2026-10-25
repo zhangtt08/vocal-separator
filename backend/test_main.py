@@ -37,10 +37,13 @@ class FakeDemucsProcess:
     def __init__(self, command, **_):
         output_root = Path(command[command.index("-o") + 1])
         input_path = Path(command[-1])
-        result_dir = output_root / main.MODEL_NAME / input_path.stem
+        model_name = command[command.index("--name") + 1] if "--name" in command else main.MODEL_NAME
+        result_dir = output_root / model_name / input_path.stem
         result_dir.mkdir(parents=True)
         if "--two-stems" in command:
             stem_names = main.BACKING_STEM_NAMES
+        elif "--name" in command and "htdemucs_6s" in command:
+            stem_names = ("vocals", "drums", "bass", "guitar", "piano", "other")
         else:
             stem_names = main.STEM_NAMES
         for stem_name in stem_names:
@@ -344,6 +347,12 @@ class BackendTests(ServiceSandbox, unittest.TestCase):
             self.assertEqual(info["bytes"], Path(info["path"]).stat().st_size)
             self.assertTrue(info["exists"])
             self.assertEqual(info["label"], main.STEM_LABELS[name]["zh"])
+
+    def test_six_stems_preset_produces_six_stems(self):
+        job_id = self._finished_job("657e00000001", "six_stems")
+        job = main.job_snapshot(job_id)
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(set(job["stems"]), {"vocals", "drums", "bass", "guitar", "piano", "other"})
 
     def test_vocal_backing_preset_produces_two_stems(self):
         job_id = self._finished_job("7b2c57000001", "vocal_backing")
@@ -661,7 +670,7 @@ class BackendTests(ServiceSandbox, unittest.TestCase):
 
         self.assertTrue(tools["ok"])
         names = [entry["name"] for entry in tools["data"]]
-        self.assertEqual(len(names), len(main.PRESETS) + 5)
+        self.assertEqual(len(names), 7)  # 7 standard tools
         self.assertTrue(all(name.startswith("vocal.") for name in names), names)
         for entry in tools["data"]:
             self.assertTrue(entry["description"])

@@ -68,13 +68,13 @@ ipcMain.handle("window:is-maximized", () => !!mainWindow?.isMaximized());
 const JOB_ID_PATTERN = /^[0-9a-f]{12}$/;
 const STEM_PATTERN = /^[a-z][a-z_]{0,19}$/;
 
-function fetchStemToFile(jobId, stem, destination) {
+function fetchStemToFile(jobId, stem, destination, format = "wav") {
   return new Promise((resolve, reject) => {
     const request = http.request(
       {
         host: API_HOST,
         port: API_PORT,
-        path: `/api/download/${jobId}/${encodeURIComponent(stem)}`,
+        path: `/api/download/${jobId}/${encodeURIComponent(stem)}?format=${encodeURIComponent(format)}`,
         method: "GET",
         timeout: 120000,
       },
@@ -109,15 +109,23 @@ ipcMain.handle("vocal:save-stem", async (_event, payload) => {
     return { saved: false, reason: "参数不合法，未写入任何文件。" };
   }
 
+  const ext = path.extname(suggested).toLowerCase() || ".wav";
+  const format = ext.replace(".", "") || "wav";
   const target = await dialog.showSaveDialog(mainWindow, {
     title: "保存音轨",
-    defaultPath: path.join(app.getPath("downloads"), suggested.endsWith(".wav") ? suggested : `${suggested}.wav`),
-    filters: [{ name: "WAV 音频", extensions: ["wav"] }],
+    defaultPath: path.join(app.getPath("downloads"), suggested),
+    filters: [
+      { name: "音频文件 (*.wav;*.mp3;*.flac)", extensions: ["wav", "mp3", "flac"] },
+      { name: "WAV 无损音频 (*.wav)", extensions: ["wav"] },
+      { name: "MP3 高音质 (*.mp3)", extensions: ["mp3"] },
+      { name: "FLAC 无损压缩 (*.flac)", extensions: ["flac"] },
+    ],
   });
   if (target.canceled || !target.filePath) return { saved: false, reason: "cancelled" };
 
   try {
-    const bytes = await fetchStemToFile(jobId, stem, target.filePath);
+    const chosenFormat = path.extname(target.filePath).replace(".", "").toLowerCase() || format;
+    const bytes = await fetchStemToFile(jobId, stem, target.filePath, chosenFormat);
     return { saved: true, path: target.filePath, bytes };
   } catch (error) {
     return { saved: false, reason: error instanceof Error ? error.message : String(error) };
@@ -411,9 +419,9 @@ function createWindow(rendererOrigin) {
     height: 860,
     minWidth: 920,
     minHeight: 680,
-    backgroundColor: "#071a20",
+    backgroundColor: "#f4f6f9",
     icon: getIconPath(),
-    show: false,
+    show: true,
     frame: false,
     webPreferences: {
       contextIsolation: true,
@@ -440,6 +448,9 @@ function createWindow(rendererOrigin) {
   });
   mainWindow.on("closed", () => {
     mainWindow = null;
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`did-fail-load: ${errorCode} ${errorDescription} ${validatedURL}`);
   });
   mainWindow.loadURL(rendererOrigin);
 }

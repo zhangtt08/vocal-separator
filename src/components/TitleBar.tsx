@@ -18,8 +18,6 @@ function shell(): VocalShell | null {
     : null;
 }
 
-// Electron installs this immutable bridge before the page loads. Hydration must
-// still start with the same empty controls as the server-rendered HTML.
 const subscribeShell = () => () => {};
 const serverShell = () => null;
 
@@ -37,13 +35,13 @@ function useMaximized(): boolean {
 const btn =
   "grid h-full w-11 place-items-center text-white/50 transition-colors hover:bg-white/10 hover:text-white";
 
-/** 窗口三键簇：嵌入应用自己的头部行。 */
+/** 窗口三键组件：嵌入应用自身标题栏中使用 */
 export function WindowControls() {
   const maximized = useMaximized();
   const s = useSyncExternalStore(subscribeShell, shell, serverShell);
   if (!s) return null;
   const btn =
-    "grid h-8 w-11 place-items-center text-white/50 transition-colors hover:bg-white/10 hover:text-white";
+    "grid h-8 w-11 place-items-center text-slate-500 transition-colors hover:bg-slate-200/80 hover:text-slate-900";
   return (
     <div className="flex items-center [-webkit-app-region:no-drag]">
       <button aria-label="最小化" className={btn} onClick={() => void s.windowControls.minimize()} type="button">
@@ -78,7 +76,7 @@ export function WindowControls() {
   );
 }
 
-/** 独立标题条：仅在页面没有自己的头部行时兜底使用（当前布局已改为内嵌模式）。 */
+/** 完整独立标题栏 */
 export function TitleBar() {
   const maximized = useMaximized();
   const s = shell();
@@ -93,7 +91,7 @@ export function TitleBar() {
       <div className="flex items-center gap-2 text-xs font-medium text-white/60">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src="/icon.svg" alt="" className="size-4" />
-        <span>声析 · 本地 AI 音轨分离</span>
+        <span>声析 - 本地 AI 音轨分离</span>
       </div>
       <div className="flex h-9 [-webkit-app-region:no-drag]">
         <button aria-label="最小化" className={btn} onClick={() => void s?.windowControls.minimize()} type="button">
