@@ -9,7 +9,8 @@ import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
-const PROTOCOL = '2.2.0';
+const PROTOCOL = '2025-06-18';
+const PROTOCOLS = ['2024-11-05', '2025-03-26', '2025-06-18'];
 const SERVER_INFO = { name: path.basename(PROJECT_ROOT) + '-agent-api', version: '1.0.0' };
 
 const log = (...a) => process.stderr.write(`[mcp] ${a.join(' ')}\n`);
@@ -40,7 +41,8 @@ async function rpc(base, method, params) {
     method: method === 'tools/list' ? 'GET' : 'POST',
     headers: { 'content-type': 'application/json', ...(API_TOKEN ? { 'x-vocal-token': API_TOKEN } : {}) },
     body: method === 'tools/list' ? undefined : JSON.stringify(params),
-    signal: AbortSignal.timeout(120_000),
+    // vocal.job_wait / separate_submit(wait) 最长 1800s，桥不能比服务端先放弃
+    signal: AbortSignal.timeout(method === 'tools/list' ? 60_000 : 1_900_000),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok || body.ok === false) throw new Error(body?.error?.message || `HTTP ${res.status}`);
@@ -53,7 +55,10 @@ async function ensureBase() {
     try {
       const r = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) });
       if (r.ok) {
-        API_TOKEN = tokenFromHealth(await r.json().catch(() => null));
+        // 8000 上可能挂着别的开发服务，只认本项目
+        const payload = await r.json().catch(() => null);
+        if (payload?.data?.project !== 'vocal-separator') continue;
+        API_TOKEN = tokenFromHealth(payload);
         return base;
       }
     } catch { /* 继续尝试 */ }
@@ -71,7 +76,9 @@ async function ensureBase() {
       try {
         const r = await fetch(`http://127.0.0.1:${p}/api/health`, { signal: AbortSignal.timeout(800) });
         if (r.ok) {
-          API_TOKEN = tokenFromHealth(await r.json().catch(() => null));
+          const payload = await r.json().catch(() => null);
+          if (payload?.data?.project !== 'vocal-separator') continue;
+          API_TOKEN = tokenFromHealth(payload);
           return `http://127.0.0.1:${p}`;
         }
       } catch { /* 未就绪 */ }
@@ -88,7 +95,7 @@ function err(id, code, message) { return { jsonrpc: '2.0', id, error: { code, me
 async function handle(req) {
   const { id, method, params } = req;
   if (method === 'initialize') {
-    return msg(id, { protocolVersion: PROTOCOL, capabilities: { tools: {} }, serverInfo: SERVER_INFO });
+    return msg(id, { protocolVersion: PROTOCOLS.includes(String(params?.protocolVersion || '').trim()) ? String(params.protocolVersion).trim() : PROTOCOL, capabilities: { tools: {} }, serverInfo: SERVER_INFO });
   }
   if (method === 'notifications/initialized' || method === 'initialized') return null;
   if (method === 'ping') return msg(id, {});

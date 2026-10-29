@@ -53,16 +53,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
             conn.request(self.command, target, body=body, headers=headers)
             upstream = conn.getresponse()
-            data = upstream.read()
             self.send_response(upstream.status, upstream.reason)
             for key, value in upstream.getheaders():
-                if key.lower() in HOP_HEADERS or key.lower() == "content-length":
+                if key.lower() in HOP_HEADERS:
                     continue
                 self.send_header(key, value)
-            self.send_header("content-length", str(len(data)))
             self.end_headers()
             if self.command != "HEAD":
-                self.wfile.write(data)
+                while True:
+                    chunk = upstream.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
         except (ConnectionRefusedError, OSError) as exc:
             # 后端没起来就如实说：页面靠这个 502 判断"服务没起"，不会误报成功。
             payload = ('{"ok":false,"error":{"code":"backend_unreachable","message":"%s"}}'
