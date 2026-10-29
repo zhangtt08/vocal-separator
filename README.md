@@ -60,10 +60,19 @@
 
 ---
 
+## 📥 下载
+
+到 [Releases](https://github.com/zhangtt08/vocal-separator/releases) 下载：
+
+- `声析-0.1.1-Windows-x64.exe`：安装版，双击按向导安装，开始菜单生成快捷方式
+- `声析-0.1.1-portable.zip`：绿色版，解压后双击 `声析.exe`
+
+系统要求：Windows 10/11 x64。首次运行会下载 Demucs 模型；有 NVIDIA 显卡可用 CUDA 加速，没有也能用 CPU。
+
 ## 🚀 快速上手
 
 ### 方式一：直接运行桌面版（开箱即用，推荐）
-1. 双击项目根目录下的 **`start.bat`**（或可执行程序快捷方式）。
+1. 从 [Releases](https://github.com/zhangtt08/vocal-separator/releases) 下载并安装/解压 **声析**，双击启动。
 2. 软件将自动启动本地服务并打开现代化操作界面。
 3. 将想要分离的音乐或视频拖入窗口。
 4. 选择 **「人声 + 伴奏（两轨）」** 或 **「四条音轨」**，点击 **「开始分离」**！
