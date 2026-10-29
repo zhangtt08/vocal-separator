@@ -64,8 +64,8 @@
 
 到 [Releases](https://github.com/zhangtt08/vocal-separator/releases) 下载：
 
-- `声析-0.1.1-Windows-x64.exe`：安装版，双击按向导安装，开始菜单生成快捷方式
-- `声析-0.1.1-portable.zip`：绿色版，解压后双击 `声析.exe`
+- `声析-0.1.1-Windows-x64.exe`：免安装单文件便携版，双击即用（首次启动会自解压到临时目录）
+- 想要固定安装位置或参与开发，可按下面的「方式二」从源码构建
 
 系统要求：Windows 10/11 x64。首次运行会下载 Demucs 模型；有 NVIDIA 显卡可用 CUDA 加速，没有也能用 CPU。
 
