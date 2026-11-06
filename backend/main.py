@@ -1935,7 +1935,20 @@ async def download_stem(
             elif target_format == "flac":
                 cmd.extend(["-c:a", "flac", str(converted_path)])
             try:
-                subprocess.run(cmd, check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 转码可能持续数秒，异步执行以免卡住事件循环（否则健康/任务轮询全部停摆）
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=30)
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"ffmpeg exited {proc.returncode}")
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    raise
             except Exception:
                 return FileResponse(file_path, media_type="audio/wav", filename=f"{source_stem}-{stem_name}.wav")
         else:

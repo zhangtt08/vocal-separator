@@ -50,6 +50,7 @@
                   "productName":  "声析",
                   "asar":  true,
                   "compression":  "normal",
+                  "electronDist":  "node_modules/electron/dist",
                   "directories":  {
                                       "output":  "release",
                                       "buildResources":  "desktop-assets"

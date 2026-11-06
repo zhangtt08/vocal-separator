@@ -16,19 +16,22 @@ if not exist "%APP_DIR%package.json" goto missing_files
 if not exist "%BACKEND_DIR%\main.py" goto missing_files
 if not exist "%APP_DIR%out\index.html" goto missing_build
 
+echo [1/4] Checking Python backend...
 where python >nul 2>&1
 if errorlevel 1 goto missing_python
 
-python -c "import fastapi, uvicorn, demucs, torch" >nul 2>&1
+powershell -NoProfile -Command "try { if ((Invoke-RestMethod -Uri '%BACKEND_URL%' -TimeoutSec 1).status -eq 'ok') { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+if not errorlevel 1 goto backend_running
+
+rem 依赖探测用 find_spec（不真正 import torch/demucs，省 5-15 秒）；
+rem 且只有后端真的需要拉起时才检查 —— 已在跑的服务不依赖这份解释器。
+python -c "import importlib.util, sys; missing = [m for m in ('fastapi', 'uvicorn', 'demucs', 'torch') if importlib.util.find_spec(m) is None]; sys.exit(1 if missing else 0)" >nul 2>&1
 if errorlevel 1 (
   echo Installing Python dependencies, this can take a few minutes...
   python -m pip install -r "%BACKEND_DIR%\requirements.txt"
   if errorlevel 1 goto missing_python_deps
 )
 
-echo [1/4] Checking Python backend...
-powershell -NoProfile -Command "try { if ((Invoke-RestMethod -Uri '%BACKEND_URL%' -TimeoutSec 1).status -eq 'ok') { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-if not errorlevel 1 goto backend_running
 start "Vocal Separator Backend - Keep Open" /D "%BACKEND_DIR%" cmd.exe /k python main.py
 goto frontend_check
 

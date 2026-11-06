@@ -121,7 +121,7 @@ try {
   mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n');
   mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n');
 
-  const mcpOut = await mcpPromise;
+  await mcpPromise;
   console.log('✓ MCP stdio bridge responded with initialize and tools/list');
   mcp.kill();
 

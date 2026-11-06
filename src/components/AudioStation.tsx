@@ -1,24 +1,15 @@
 "use client";
 
 import {
-  AlertCircle,
   ArrowRight,
   AudioWaveform,
-  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Clock,
-  Cpu,
   Download,
-  FileAudio,
   FileText,
   Folder,
-  FolderOpen,
-  HardDrive,
   Home,
-  Layers,
-  Loader2,
-  MoreHorizontal,
   Pause,
   Play,
   PlayCircle,
@@ -27,15 +18,9 @@ import {
   Scissors,
   Search,
   Settings,
-  ShieldCheck,
   Sliders,
-  Sparkles,
   Sun,
-  Trash2,
   Upload,
-  Volume2,
-  VolumeX,
-  X,
 } from "lucide-react";
 import React, {
   useCallback,
@@ -48,6 +33,17 @@ import { WindowControls } from "@/components/TitleBar";
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
   (process.env.NODE_ENV === "production" ? "" : "http://localhost:8000");
+
+/** Electron 壳注入的原生桥（preload 里 exposeInMainWorld 的 vocal 对象）。 */
+interface VocalBridge {
+  revealPath?: (targetPath: string) => void;
+  saveStem?: (args: { jobId: string; stem: string; suggestedName: string }) => void;
+}
+
+function vocalBridge(): VocalBridge | undefined {
+  if (typeof window === "undefined") return undefined;
+  return (window as unknown as { vocal?: VocalBridge }).vocal;
+}
 
 interface StemInfo {
   label?: string;
@@ -77,6 +73,7 @@ interface HealthData {
   status?: string;
   can_separate?: boolean;
   torch_version?: string;
+  cuda_available?: boolean;
   cuda_device_name?: string;
   demucs_version?: string;
   ffmpeg_path?: string;
@@ -119,7 +116,7 @@ export function AudioStation() {
   const [uploadPercent, setUploadPercent] = useState(0);
 
   // 参数配置
-  const [presetScheme, setPresetScheme] = useState<string>("smart_enhance");
+  const [presetScheme, setPresetScheme] = useState<string>("vocal_backing");
   const [denoiseEnabled, setDenoiseEnabled] = useState(true);
   const [vocalBoostEnabled, setVocalBoostEnabled] = useState(true);
   const [normalizeEnabled, setNormalizeEnabled] = useState(false);
@@ -136,8 +133,8 @@ export function AudioStation() {
   // 文件上传隐藏 input
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // 轮询服务存活与硬件状态
-  const refreshHealth = useCallback(async () => {
+  // 轮询服务存活与硬件状态；返回本轮是否在线（供轮询退避用）
+  const refreshHealth = useCallback(async (): Promise<boolean> => {
     try {
       const res = await fetch(`${API_BASE}/api/health`);
       if (res.ok) {
@@ -146,11 +143,13 @@ export function AudioStation() {
         if (json.data) {
           setHealth(json.data);
         }
-      } else {
-        setIsBackendOnline(false);
+        return true;
       }
+      setIsBackendOnline(false);
+      return false;
     } catch {
       setIsBackendOnline(false);
+      return false;
     }
   }, []);
 
@@ -170,10 +169,15 @@ export function AudioStation() {
           stems: Array<{ name: string; label?: string; path?: string; bytes?: number; exists?: boolean }>;
         }>;
         if (items.length > 0) {
+          const PRESET_LABEL: Record<string, string> = {
+            four_stems: "人声分离 (四轨)",
+            six_stems: "人声分离 (六轨)",
+            fine_tuned: "人声分离 (精细)",
+            vocal_backing: "人声 + 伴奏",
+          };
           const mapped: HistoryItem[] = items.map((it) => ({
             ...it,
-            duration: "03:45",
-            type: it.preset === "four_stems" ? "人声分离 (四轨)" : "人声 + 伴奏",
+            type: PRESET_LABEL[it.preset ?? ""] || "人声 + 伴奏",
             statusText: "已完成",
             statusColor: "emerald",
           }));
@@ -186,12 +190,20 @@ export function AudioStation() {
   }, []);
 
   useEffect(() => {
-    refreshHealth();
-    refreshHistory();
-    const timer = setInterval(() => {
-      refreshHealth();
-    }, 4000);
-    return () => clearInterval(timer);
+    // 在线时 4 秒一轮；后端离线时退避到 10 秒，避免界面对一个不存在的服务高频空转
+    let online = true;
+    let timer: number | undefined;
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(async () => {
+        void refreshHistory();
+        online = await refreshHealth();
+        schedule(online ? 4000 : 10000);
+      }, delay);
+    };
+    schedule(0);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+    };
   }, [refreshHealth, refreshHistory]);
 
   // 轮询当前任务状态
@@ -287,15 +299,22 @@ export function AudioStation() {
   // 取消任务
   const cancelProcessing = async () => {
     if (!activeJob) return;
+    if (activeJob.status === "cancelling") return; // 已经在取消流程里，别重复发
     try {
       let token = "";
       const tokRes = await fetch(`${API_BASE}/api/session-token`);
       if (tokRes.ok) token = (await tokRes.json()).token || "";
-      await fetch(`${API_BASE}/api/jobs/${activeJob.job_id}/cancel`, {
+      const res = await fetch(`${API_BASE}/api/jobs/${activeJob.job_id}/cancel`, {
         method: "POST",
         headers: token ? { "x-vocal-token": token } : {},
       });
-      setActiveJob((prev) => (prev ? { ...prev, status: "cancelled", phase_label: "已取消" } : null));
+      if (!res.ok) {
+        // 任务已经结束（409）等情形：不把本地状态改成"已取消"，让下一秒的轮询带回真实状态
+        alert("取消失败：任务可能已经结束，正在刷新状态。");
+        return;
+      }
+      // 后端已受理：置 cancelling，等轮询带回终态；demucs 终止需要几百毫秒到数秒
+      setActiveJob((prev) => (prev ? { ...prev, status: "cancelling", phase_label: "正在取消…" } : null));
     } catch {
       alert("取消请求发送失败");
     }
@@ -318,21 +337,24 @@ export function AudioStation() {
 
   // 打开所在目录 (Electron IPC)
   const revealInFolder = (targetPath?: string) => {
-    if (typeof window !== "undefined" && (window as any).vocal?.revealPath && targetPath) {
-      (window as any).vocal.revealPath(targetPath);
+    if (typeof window !== "undefined" && vocalBridge()?.revealPath && targetPath) {
+      vocalBridge()?.revealPath?.(targetPath);
     } else {
       alert("已在系统默认下载目录中，文件路径:\n" + (targetPath || "outputs 目录"));
     }
   };
 
   // 导出/保存音轨 (Electron IPC or browser download)
+  // 「输出格式」是全局偏好：保存时按它换扩展名，后端 /api/download 支持 wav|mp3|flac
   const saveStem = (jobId: string, stem: string, suggestedName: string) => {
-    if (typeof window !== "undefined" && (window as any).vocal?.saveStem) {
-      (window as any).vocal.saveStem({ jobId, stem, suggestedName });
+    const fmt = outputFormat.toLowerCase();
+    const name = `${suggestedName.replace(/\.(wav|mp3|flac)$/i, "")}.${fmt}`;
+    if (typeof window !== "undefined" && vocalBridge()?.saveStem) {
+      vocalBridge()?.saveStem?.({ jobId, stem, suggestedName: name });
     } else {
       const a = document.createElement("a");
-      a.href = `${API_BASE}/api/download/${jobId}/${stem}`;
-      a.download = suggestedName;
+      a.href = `${API_BASE}/api/download/${jobId}/${stem}?format=${fmt}`;
+      a.download = name;
       a.click();
     }
   };
@@ -405,7 +427,7 @@ export function AudioStation() {
               return (
                 <button
                   key={id}
-                  onClick={() => setActiveTab(id as any)}
+                  onClick={() => setActiveTab(id as typeof activeTab)}
                   type="button"
                   className={`group relative flex w-full items-center gap-3.5 rounded-2xl px-4 py-3 text-sm transition-all ${
                     isActive
@@ -441,14 +463,8 @@ export function AudioStation() {
           <p className="mt-1 text-[11px] text-slate-400">
             {health?.disk_free_mb
               ? `${(health.disk_free_mb / 1024).toFixed(0)} GB 剩余可用`
-              : "128 GB / 500 GB"}
+              : "检测中…"}
           </p>
-          <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-200/80">
-            <div
-              className="h-full rounded-full bg-[#FA541C] transition-all duration-500"
-              style={{ width: "26%" }}
-            />
-          </div>
         </div>
       </aside>
 
@@ -713,16 +729,16 @@ export function AudioStation() {
                             )}
                           </div>
 
-                          {/* 时长 */}
+                          {/* 时长：后端不记录音频时长，不编造数值 */}
                           <div className="col-span-2 text-slate-400 font-medium">
-                            {item.duration || "03:45"}
+                            {item.duration || "—"}
                           </div>
 
                           {/* 大小 */}
                           <div className="col-span-1 text-slate-500">
                             {item.source_bytes
                               ? `${(item.source_bytes / (1024 * 1024)).toFixed(1)} MB`
-                              : "8.2 MB"}
+                              : "—"}
                           </div>
 
                           {/* 状态 */}
@@ -790,6 +806,12 @@ export function AudioStation() {
                   {/* 拖拽上传区 */}
                   <div
                     onClick={() => fileInputRef.current?.click()}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const file = e.dataTransfer.files?.[0];
+                      if (file) handleFileSelected(file);
+                    }}
                     className="mt-6 flex flex-col items-center justify-center rounded-3xl border-2 border-dashed border-slate-200 bg-slate-50/60 p-10 text-center transition-all hover:border-[#FA541C] hover:bg-[#FFF7F2]/40 cursor-pointer"
                   >
                     <div className="flex size-14 items-center justify-center rounded-2xl bg-orange-100 text-[#FA541C]">
@@ -833,6 +855,14 @@ export function AudioStation() {
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
+                          title="打开所在文件夹"
+                          onClick={() => revealInFolder(item.output_dir)}
+                          className="rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                        >
+                          打开文件夹
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => saveStem(item.job_id, "vocals", `${item.source_name}-人声.wav`)}
                           className="rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
                         >
@@ -866,7 +896,7 @@ export function AudioStation() {
                   <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
                     <p className="text-xs text-slate-400">可用磁盘空间</p>
                     <p className="mt-1 text-xl font-bold text-slate-800">
-                      {health?.disk_free_mb ? (health.disk_free_mb / 1024).toFixed(1) + " GB" : "128 GB"}
+                      {health?.disk_free_mb ? (health.disk_free_mb / 1024).toFixed(1) + " GB" : "检测中…"}
                     </p>
                   </div>
                   <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
@@ -888,21 +918,24 @@ export function AudioStation() {
                 <div className="space-y-3 text-xs">
                   <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                     <span className="text-slate-500">计算硬件 (GPU)</span>
-                    <span className="font-semibold text-emerald-600">
-                      {health?.cuda_device_name || "NVIDIA GeForce GTX 1660 SUPER"} (CUDA 加速已启用)
+                    <span className={health?.cuda_available ? "font-semibold text-emerald-600" : "font-semibold text-slate-500"}>
+                      {health?.cuda_device_name || "未检测到 CUDA 设备"}
+                      {health?.cuda_available ? " (CUDA 加速已启用)" : " (CPU 模式)"}
                     </span>
                   </div>
                   <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                     <span className="text-slate-500">AI 分离模型</span>
-                    <span className="font-semibold text-slate-800">HTDemucs 4.1.0</span>
+                    <span className="font-semibold text-slate-800">
+                      {health?.demucs_version ? `HTDemucs ${health.demucs_version}` : "检测中…"}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                     <span className="text-slate-500">PyTorch 框架版本</span>
-                    <span className="font-semibold text-slate-800">{health?.torch_version || "2.6.0+cu124"}</span>
+                    <span className="font-semibold text-slate-800">{health?.torch_version || "检测中…"}</span>
                   </div>
                   <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                     <span className="text-slate-500">音视频转码引擎 (FFmpeg)</span>
-                    <span className="font-semibold text-slate-800">已就绪 (backend/ffmpeg.exe)</span>
+                    <span className="font-semibold text-slate-800">{health?.ffmpeg_path ? "已就绪" : "未检测到"}</span>
                   </div>
                   <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                     <span className="text-slate-500">本地服务端口</span>
@@ -967,9 +1000,10 @@ export function AudioStation() {
                   <button
                     type="button"
                     onClick={cancelProcessing}
-                    className="mt-4 w-full rounded-2xl border border-slate-200 py-2.5 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50 active:scale-98 cursor-pointer"
+                    disabled={activeJob.status === "cancelling"}
+                    className="mt-4 w-full rounded-2xl border border-slate-200 py-2.5 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50 active:scale-98 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    取消处理
+                    {activeJob.status === "cancelling" ? "正在取消…" : "取消处理"}
                   </button>
                 )}
               </div>
@@ -990,8 +1024,6 @@ export function AudioStation() {
                       className="w-full appearance-none rounded-2xl border border-slate-200 bg-slate-50/50 px-3.5 py-2.5 text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                     >
                       <option value="vocal_backing">智能增强 (推荐)</option>
-                      <option value="smart_enhance">智能增强 (推荐)</option>
-                      <option value="vocal_backing">人声 + 伴奏 (翻唱/卡拉OK)</option>
                       <option value="four_stems">四条音轨 (人声/鼓组/贝斯/其他)</option>
                     </select>
                     <ChevronDown className="pointer-events-none absolute right-3 top-3 size-4 text-slate-400" />
